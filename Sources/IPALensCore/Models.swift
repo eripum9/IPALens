@@ -496,6 +496,8 @@ public struct TextPreview: Codable, Sendable, Hashable {
     public let text: String
     public let syntax: String
     public let isTruncated: Bool
+    public let displayedByteCount: Int64
+    public let totalByteCount: Int64
 }
 
 public struct ImagePreview: Codable, Sendable, Hashable {

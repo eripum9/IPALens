@@ -53,7 +53,12 @@ final class WorkspaceModel: ObservableObject {
     @Published var snapshot: PackageSnapshot?
     @Published var selectedSection: SidebarSection = .files
     @Published var selectedEntryPath: String? {
-        didSet { schedulePreview() }
+        didSet {
+            if oldValue != selectedEntryPath {
+                textPreviewByteLimit = ArchiveSafetyLimits.maximumPreviewBytes
+            }
+            schedulePreview()
+        }
     }
     @Published var selectedBundlePath: String?
     @Published var preview: PreviewPayload?
@@ -64,6 +69,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var isSearching = false
     @Published var isTreeLoading = false
     @Published private(set) var treeRoots: [FileTreeNode] = []
+    @Published private(set) var expandedDirectoryPaths: Set<String> = []
     @Published var isDropTargeted = false
     @Published var query = "" {
         didSet { scheduleSearch() }
@@ -89,6 +95,7 @@ final class WorkspaceModel: ObservableObject {
     private var searchGeneration = UUID()
     private var hasSecurityScope = false
     private var activePluginID: String?
+    private var textPreviewByteLimit = ArchiveSafetyLimits.maximumPreviewBytes
     nonisolated(unsafe) private var securityScopedURL: URL?
 
     deinit {
@@ -120,6 +127,16 @@ final class WorkspaceModel: ObservableObject {
     var selectedSigning: SigningSummary? {
         guard let path = selectedBundle?.bundlePath else { return nil }
         return snapshot?.signing.first { $0.bundlePath == path }
+    }
+
+    var canLoadMoreTextPreview: Bool {
+        guard case .text(let text) = preview, text.isTruncated else { return false }
+        return textPreviewByteLimit < ArchiveSafetyLimits.maximumExpandedTextPreviewBytes
+    }
+
+    var hasReachedExpandedTextPreviewLimit: Bool {
+        guard case .text(let text) = preview, text.isTruncated else { return false }
+        return textPreviewByteLimit >= ArchiveSafetyLimits.maximumExpandedTextPreviewBytes
     }
 
     func presentOpenPanel() {
@@ -225,6 +242,7 @@ final class WorkspaceModel: ObservableObject {
         snapshot = nil
         entriesByPath = [:]
         treeRoots = []
+        expandedDirectoryPaths = []
         preview = nil
         selectedEntryPath = nil
         selectedBundlePath = nil
@@ -303,6 +321,15 @@ final class WorkspaceModel: ObservableObject {
         releaseSecurityScope()
     }
 
+    func loadMoreTextPreview() {
+        guard canLoadMoreTextPreview else { return }
+        textPreviewByteLimit = min(
+            textPreviewByteLimit + ArchiveSafetyLimits.maximumPreviewBytes,
+            ArchiveSafetyLimits.maximumExpandedTextPreviewBytes
+        )
+        schedulePreview()
+    }
+
     func exportReport() {
         guard let snapshot else { return }
         let panel = NSSavePanel()
@@ -349,8 +376,29 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectInspectionPath(_ path: String) {
+        revealEntry(path)
         selectedSection = .files
         selectedEntryPath = path
+    }
+
+    func isDirectoryExpanded(_ path: String) -> Bool {
+        expandedDirectoryPaths.contains(path)
+    }
+
+    func setDirectoryExpanded(_ isExpanded: Bool, path: String) {
+        if isExpanded {
+            expandedDirectoryPaths.insert(path)
+        } else {
+            expandedDirectoryPaths.remove(path)
+        }
+    }
+
+    private func revealEntry(_ path: String) {
+        var parentPath = entriesByPath[path]?.parentPath
+        while let current = parentPath {
+            expandedDirectoryPaths.insert(current)
+            parentPath = entriesByPath[current]?.parentPath
+        }
     }
 
     private func schedulePreview() {
@@ -364,10 +412,15 @@ final class WorkspaceModel: ObservableObject {
         previewLoadingMessage = entry.kind == .directory
             ? "Reading folder contents"
             : "Preparing \(ByteCountFormatter.string(fromByteCount: entry.uncompressedSize, countStyle: .file)) preview"
+        let requestedTextByteLimit = textPreviewByteLimit
         previewTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let payload = try await engine.preview(url: sourceURL, entryPath: selectedEntryPath)
+                let payload = try await engine.preview(
+                    url: sourceURL,
+                    entryPath: selectedEntryPath,
+                    textByteLimit: requestedTextByteLimit
+                )
                 guard !Task.isCancelled, previewGeneration == generation else { return }
                 preview = payload
                 isPreviewLoading = false

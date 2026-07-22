@@ -6,6 +6,7 @@ public enum ArchiveSafetyLimits {
     public static let maximumEntryCount = 200_000
     public static let maximumUncompressedSize: Int64 = 20 * 1_024 * 1_024 * 1_024
     public static let maximumPreviewBytes: Int64 = 5 * 1_024 * 1_024
+    public static let maximumExpandedTextPreviewBytes: Int64 = 25 * 1_024 * 1_024
     public static let hexPageBytes = 64 * 1_024
     public static let minimumFreeSpaceReserve: Int64 = 1 * 1_024 * 1_024 * 1_024
 }

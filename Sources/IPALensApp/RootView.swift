@@ -370,18 +370,67 @@ private struct FileBrowserView: View {
                 }
             }
         } else {
-            List(selection: $model.selectedEntryPath) {
-                OutlineGroup(model.treeRoots, children: \.children) { node in
-                    EntryRow(entry: node.entry)
-                        .tag(node.entry.path)
+            ScrollViewReader { proxy in
+                List(selection: $model.selectedEntryPath) {
+                    ForEach(model.treeRoots) { node in
+                        PersistentFileTreeNode(node: node, model: model)
+                    }
                 }
-            }
-            .overlay {
-                if model.isTreeLoading {
-                    LoadingStateView(message: "Building file tree", detail: "Organizing package folders in the background.")
+                .onAppear {
+                    if let selectedEntryPath = model.selectedEntryPath {
+                        proxy.scrollTo(selectedEntryPath, anchor: .center)
+                    }
+                }
+                .overlay {
+                    if model.isTreeLoading {
+                        LoadingStateView(message: "Building file tree", detail: "Organizing package folders in the background.")
+                    }
                 }
             }
         }
+    }
+}
+
+private struct PersistentFileTreeNode: View {
+    let node: FileTreeNode
+    @ObservedObject var model: WorkspaceModel
+
+    @ViewBuilder
+    var body: some View {
+        if let children = node.children {
+            DisclosureGroup(isExpanded: Binding(
+                get: { model.isDirectoryExpanded(node.entry.path) },
+                set: { model.setDirectoryExpanded($0, path: node.entry.path) }
+            )) {
+                ForEach(children) { child in
+                    PersistentFileTreeNode(node: child, model: model)
+                }
+            } label: {
+                selectableRow
+            }
+            .tag(node.entry.path)
+            .id(node.entry.path)
+        } else {
+            selectableRow
+                .tag(node.entry.path)
+                .id(node.entry.path)
+        }
+    }
+
+    private var selectableRow: some View {
+        EntryRow(entry: node.entry)
+            .contentShape(Rectangle())
+            .background {
+                if model.selectedEntryPath == node.entry.path {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.22))
+                        .padding(.horizontal, -5)
+                        .padding(.vertical, -2)
+                }
+            }
+            .onTapGesture {
+                model.selectedEntryPath = node.entry.path
+            }
     }
 }
 

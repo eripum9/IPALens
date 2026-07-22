@@ -191,7 +191,8 @@ public actor PackageInspectionEngine {
     public func preview(
         url: URL,
         entryPath: String,
-        hexOffset: Int64 = 0
+        hexOffset: Int64 = 0,
+        textByteLimit: Int64 = ArchiveSafetyLimits.maximumPreviewBytes
     ) async throws -> PreviewPayload {
         let index = try cachedOrBuildIndex(url)
         guard let entry = index.entryByPath[entryPath] else {
@@ -212,36 +213,6 @@ public actor PackageInspectionEngine {
         }
 
         let lowercasedName = entry.name.lowercased()
-        if let typeIdentifier = videoTypeIdentifier(name: lowercasedName) {
-            let fileURL = try await materializeMediaEntry(
-                archiveURL: url,
-                index: index,
-                entry: entry,
-                entryPath: entryPath
-            )
-            return .video(.init(
-                fileURL: fileURL,
-                originalFileName: entry.name,
-                fileSize: entry.uncompressedSize,
-                typeIdentifier: typeIdentifier
-            ))
-        }
-
-        if let typeIdentifier = audioTypeIdentifier(name: lowercasedName) {
-            let fileURL = try await materializeMediaEntry(
-                archiveURL: url,
-                index: index,
-                entry: entry,
-                entryPath: entryPath
-            )
-            return .audio(.init(
-                fileURL: fileURL,
-                originalFileName: entry.name,
-                fileSize: entry.uncompressedSize,
-                typeIdentifier: typeIdentifier
-            ))
-        }
-
         if lowercasedName == "embedded.mobileprovision" {
             return try await runBlocking {
                 let data = try ArchiveIndexer.readEntry(url: url, index: index, path: entryPath).data
@@ -275,35 +246,76 @@ public actor PackageInspectionEngine {
             }
         }
 
-        if entry.uncompressedSize <= 512 * 1_024 * 1_024 {
-            let header = try await runBlocking {
-                try ArchiveIndexer.readEntry(
-                    url: url,
-                    index: index,
-                    path: entryPath,
-                    maximumBytes: min(entry.uncompressedSize, 4 * 1_024 * 1_024)
-                ).data
-            }
-            if MachOParser.looksLikeMachO(header) {
+        let probe = try await runBlocking {
+            try ArchiveIndexer.readEntry(
+                url: url,
+                index: index,
+                path: entryPath,
+                maximumBytes: min(entry.uncompressedSize, 64 * 1_024)
+            ).data
+        }
+        if entry.uncompressedSize <= 512 * 1_024 * 1_024,
+           MachOParser.looksLikeMachO(probe) {
                 return try await runBlocking {
                     let fullData = try ArchiveIndexer.readEntry(url: url, index: index, path: entryPath).data
                     return .machO(try MachOParser.parse(data: fullData))
                 }
-            }
         }
 
-        if isText(name: lowercasedName) {
-            let syntax = syntaxName(name: lowercasedName)
-            return try await runBlocking {
-                let result = try ArchiveIndexer.readEntry(
-                    url: url,
-                    index: index,
-                    path: entryPath,
-                    maximumBytes: ArchiveSafetyLimits.maximumPreviewBytes
-                )
-                let text = String(decoding: result.data, as: UTF8.self)
-                return .text(.init(text: text, syntax: syntax, isTruncated: result.truncated))
-            }
+        let isDeclaredText = TextFileSupport.isDeclaredText(name: lowercasedName)
+        if isDeclaredText,
+           let preview = try await textPreview(
+                archiveURL: url,
+                index: index,
+                entry: entry,
+                allowLegacyEncoding: true,
+                byteLimit: textByteLimit
+           ) {
+            return preview
+        }
+
+        // TypeScript and MPEG transport streams both use .ts. Source text wins only
+        // when its bytes decode cleanly; binary transport streams continue to video.
+        if let typeIdentifier = videoTypeIdentifier(name: lowercasedName) {
+            let fileURL = try await materializeMediaEntry(
+                archiveURL: url,
+                index: index,
+                entry: entry,
+                entryPath: entryPath
+            )
+            return .video(.init(
+                fileURL: fileURL,
+                originalFileName: entry.name,
+                fileSize: entry.uncompressedSize,
+                typeIdentifier: typeIdentifier
+            ))
+        }
+
+        if let typeIdentifier = audioTypeIdentifier(name: lowercasedName) {
+            let fileURL = try await materializeMediaEntry(
+                archiveURL: url,
+                index: index,
+                entry: entry,
+                entryPath: entryPath
+            )
+            return .audio(.init(
+                fileURL: fileURL,
+                originalFileName: entry.name,
+                fileSize: entry.uncompressedSize,
+                typeIdentifier: typeIdentifier
+            ))
+        }
+
+        if !isDeclaredText,
+           TextFileSupport.decode(probe, allowLegacyEncoding: false) != nil,
+           let preview = try await textPreview(
+                archiveURL: url,
+                index: index,
+                entry: entry,
+                allowLegacyEncoding: false,
+                byteLimit: textByteLimit
+           ) {
+            return preview
         }
 
         return try await runBlocking {
@@ -347,8 +359,10 @@ public actor PackageInspectionEngine {
                    PropertyListSerialization.propertyList(object, isValidFor: .xml),
                    let xml = try? PropertyListSerialization.data(fromPropertyList: object, format: .xml, options: 0) {
                     text = String(decoding: xml, as: UTF8.self)
+                } else if let decoded = TextFileSupport.decode(data, allowLegacyEncoding: true) {
+                    text = decoded
                 } else {
-                    text = String(decoding: data, as: UTF8.self)
+                    continue
                 }
                 if let range = text.range(of: trimmed, options: [.caseInsensitive, .diacriticInsensitive]) {
                     let snippet = makeSnippet(text: text, around: range)
@@ -455,6 +469,39 @@ public actor PackageInspectionEngine {
         return destination
     }
 
+    private func textPreview(
+        archiveURL: URL,
+        index: ArchiveIndex,
+        entry: PackageEntry,
+        allowLegacyEncoding: Bool,
+        byteLimit: Int64
+    ) async throws -> PreviewPayload? {
+        try await runBlocking {
+            let boundedLimit = min(
+                max(1, byteLimit),
+                ArchiveSafetyLimits.maximumExpandedTextPreviewBytes
+            )
+            let result = try ArchiveIndexer.readEntry(
+                url: archiveURL,
+                index: index,
+                path: entry.path,
+                maximumBytes: boundedLimit
+            )
+            guard let text = TextFileSupport.decode(
+                result.data,
+                allowLegacyEncoding: allowLegacyEncoding
+            ) else { return nil }
+            let syntax = TextFileSupport.syntax(name: entry.name, contents: text) ?? "Plain Text"
+            return .text(.init(
+                text: text,
+                syntax: syntax,
+                isTruncated: result.truncated,
+                displayedByteCount: Int64(result.data.count),
+                totalByteCount: entry.uncompressedSize
+            ))
+        }
+    }
+
     private nonisolated static func hexPreview(
         url: URL,
         index: ArchiveIndex,
@@ -497,9 +544,10 @@ public actor PackageInspectionEngine {
             return type.identifier
         }
         let additionalAudioExtensions: Set<String> = [
-            "aac", "ac3", "aif", "aifc", "aiff", "alac", "amr", "au", "caf", "eac3",
-            "flac", "m4a", "m4b", "mka", "mp2", "mp3", "oga", "ogg", "opus", "snd",
-            "wav", "wave", "weba", "wma"
+            "aa", "aac", "aax", "ac3", "aif", "aifc", "aiff", "alac", "amr", "ape", "au",
+            "caf", "dts", "eac3", "flac", "m4a", "m4b", "m4p", "m4r", "mid", "midi", "mka",
+            "mod", "mp2", "mp3", "mpa", "oga", "ogg", "opus", "ra", "ram", "snd", "tta",
+            "voc", "wav", "wave", "weba", "wma", "wv", "xm"
         ]
         return additionalAudioExtensions.contains(fileExtension)
             ? UTType(filenameExtension: fileExtension)?.identifier ?? "public.audio"
@@ -535,32 +583,8 @@ public actor PackageInspectionEngine {
         }
     }
 
-    private func isText(name: String) -> Bool {
-        let extensions = [
-            "txt", "json", "xml", "html", "htm", "css", "js", "mjs", "ts", "tsx",
-            "swift", "m", "mm", "h", "hpp", "c", "cpp", "md", "yaml", "yml", "csv",
-            "stringsdict", "storyboard", "xib", "entitlements", "conf", "ini", "log", "sql"
-        ]
-        return extensions.contains((name as NSString).pathExtension)
-    }
-
     private func isSearchableText(name: String) -> Bool {
-        isText(name: name) || isPropertyList(name: name)
-    }
-
-    private func syntaxName(name: String) -> String {
-        switch (name as NSString).pathExtension {
-        case "json": "JSON"
-        case "xml", "storyboard", "xib": "XML"
-        case "html", "htm": "HTML (source)"
-        case "css": "CSS"
-        case "js", "mjs": "JavaScript"
-        case "ts", "tsx": "TypeScript"
-        case "swift": "Swift"
-        case "md": "Markdown"
-        case "yaml", "yml": "YAML"
-        default: "Plain text"
-        }
+        TextFileSupport.isDeclaredText(name: name) || isPropertyList(name: name)
     }
 }
 

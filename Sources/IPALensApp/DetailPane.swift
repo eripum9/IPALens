@@ -62,7 +62,10 @@ private struct FileDetail: View {
                 PreviewView(
                     payload: model.preview,
                     isLoading: model.isPreviewLoading,
-                    loadingMessage: model.previewLoadingMessage
+                    loadingMessage: model.previewLoadingMessage,
+                    canLoadMoreText: model.canLoadMoreTextPreview,
+                    hasReachedTextLimit: model.hasReachedExpandedTextPreviewLimit,
+                    onLoadMoreText: model.loadMoreTextPreview
                 )
                 Divider()
                 HStack(spacing: 16) {
@@ -90,6 +93,9 @@ private struct PreviewView: View {
     let payload: PreviewPayload?
     let isLoading: Bool
     let loadingMessage: String
+    let canLoadMoreText: Bool
+    let hasReachedTextLimit: Bool
+    let onLoadMoreText: () -> Void
 
     var body: some View {
         Group {
@@ -136,14 +142,46 @@ private struct PreviewView: View {
                 VideoPreviewView(preview: video)
             case .text(let text):
                 VStack(spacing: 0) {
-                    if text.isTruncated {
-                        Label("Showing the first 5 MiB", systemImage: "scissors")
-                            .font(.caption).foregroundStyle(.orange).padding(6)
+                    HStack(spacing: 10) {
+                        Label(text.syntax, systemImage: "chevron.left.forwardslash.chevron.right")
+                            .font(.caption.weight(.medium))
+                        Spacer()
+                        if text.isTruncated {
+                            Label(
+                                "Showing \(ByteCountFormatter.string(fromByteCount: text.displayedByteCount, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: text.totalByteCount, countStyle: .file))",
+                                systemImage: "scissors"
+                            )
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
-                    TextEditor(text: .constant(text.text))
-                        .font(.system(.body, design: .monospaced))
-                        .scrollContentBackground(.hidden)
-                        .padding(6)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.bar)
+                    Divider()
+                    SourceCodePreviewView(text: text.text, syntax: text.syntax)
+                    if text.isTruncated {
+                        Divider()
+                        if canLoadMoreText {
+                            Button(action: onLoadMoreText) {
+                                Label("View More", systemImage: "chevron.down")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.vertical, 9)
+                            .background(.bar)
+                        } else if hasReachedTextLimit {
+                            Label(
+                                "Interactive preview limit reached. Export the file to view the remainder.",
+                                systemImage: "externaldrive"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(.bar)
+                        }
+                    }
                 }
             case .machO(let summary):
                 MachOPreview(summary: summary)

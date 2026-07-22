@@ -52,6 +52,28 @@ struct MachOParserTests {
     }
 }
 
+@Suite("Text source detection")
+struct TextSourceDetectionTests {
+    @Test func recognizesLanguagesAndShebangs() {
+        #expect(TextFileSupport.syntax(name: "server.cjs", contents: nil) == "JavaScript")
+        #expect(TextFileSupport.syntax(name: "tool.py", contents: nil) == "Python")
+        #expect(TextFileSupport.syntax(name: "View.java", contents: nil) == "Java")
+        #expect(TextFileSupport.syntax(name: "Feature.swift", contents: nil) == "Swift")
+        #expect(TextFileSupport.syntax(name: "Page.html", contents: nil) == "HTML")
+        #expect(TextFileSupport.syntax(name: "run", contents: "#!/usr/bin/env node\n") == "JavaScript")
+    }
+
+    @Test func decodesUnicodeButRejectsBinaryContent() throws {
+        let utf8 = try #require(TextFileSupport.decode(Data("Hello, 世界".utf8), allowLegacyEncoding: false))
+        #expect(utf8 == "Hello, 世界")
+
+        var utf16 = Data([0xFF, 0xFE])
+        utf16.append(try #require("Hello".data(using: .utf16LittleEndian)))
+        #expect(TextFileSupport.decode(utf16, allowLegacyEncoding: false) == "Hello")
+        #expect(TextFileSupport.decode(Data([0x00, 0x01, 0x02, 0xFF]), allowLegacyEncoding: false) == nil)
+    }
+}
+
 @Suite("Inspection engine")
 struct InspectionEngineTests {
     @Test func indexesInspectsPreviewsSearchesAndExports() async throws {
@@ -106,6 +128,60 @@ struct InspectionEngineTests {
         }
         #expect(text.text.contains("needle for content search"))
 
+        let sourcePreviews = [
+            ("server.cjs", "JavaScript"),
+            ("package.json", "JSON"),
+            ("tool.py", "Python"),
+            ("Page.html", "HTML"),
+            ("View.java", "Java"),
+            ("Feature.swift", "Swift"),
+            ("run-node", "JavaScript"),
+            ("notes.weirdsource", "Plain Text")
+        ]
+        for (fileName, expectedSyntax) in sourcePreviews {
+            let preview = try await engine.preview(
+                url: fixture.ipa,
+                entryPath: "Payload/Demo.app/\(fileName)"
+            )
+            guard case .text(let source) = preview else {
+                Issue.record("Expected a text preview for \(fileName)")
+                continue
+            }
+            #expect(source.syntax == expectedSyntax)
+        }
+
+        let initialLargeSource = try await engine.preview(
+            url: fixture.ipa,
+            entryPath: "Payload/Demo.app/large.swift",
+            textByteLimit: 64
+        )
+        guard case .text(let initialPage) = initialLargeSource else {
+            Issue.record("Expected a paged source preview")
+            return
+        }
+        #expect(initialPage.isTruncated)
+        #expect(initialPage.displayedByteCount == 64)
+        let expandedLargeSource = try await engine.preview(
+            url: fixture.ipa,
+            entryPath: "Payload/Demo.app/large.swift",
+            textByteLimit: 256
+        )
+        guard case .text(let expandedPage) = expandedLargeSource else {
+            Issue.record("Expected an expanded source preview")
+            return
+        }
+        #expect(expandedPage.displayedByteCount == 256)
+        #expect(expandedPage.text.count > initialPage.text.count)
+
+        let binaryPreview = try await engine.preview(
+            url: fixture.ipa,
+            entryPath: "Payload/Demo.app/blob.weirdsource"
+        )
+        guard case .hex = binaryPreview else {
+            Issue.record("Expected unknown binary content to remain a hex preview")
+            return
+        }
+
         let audioPreview = try await engine.preview(
             url: fixture.ipa,
             entryPath: "Payload/Demo.app/tone.wav"
@@ -118,6 +194,17 @@ struct InspectionEngineTests {
         #expect(audio.fileSize == Int64(FixtureFactory.wavSilence().count))
         #expect(try Data(contentsOf: audio.fileURL) == FixtureFactory.wavSilence())
         let materializedAudioURL = audio.fileURL
+
+        let m4aPreview = try await engine.preview(
+            url: fixture.ipa,
+            entryPath: "Payload/Demo.app/tone.m4a"
+        )
+        guard case .audio(let m4a) = m4aPreview else {
+            Issue.record("Expected an M4A audio preview")
+            return
+        }
+        #expect(m4a.originalFileName == "tone.m4a")
+        #expect(try Data(contentsOf: m4a.fileURL) == FixtureFactory.mp4Stub())
 
         let videoPreview = try await engine.preview(
             url: fixture.ipa,
@@ -424,7 +511,18 @@ private enum FixtureFactory {
         try machO64(linkedLibrary: "@rpath/Injected.dylib").write(to: app.appendingPathComponent("Demo"))
         try machO64(linkedLibrary: "/usr/lib/libSystem.B.dylib").write(to: frameworks.appendingPathComponent("Injected.dylib"))
         try Data("needle for content search\n".utf8).write(to: app.appendingPathComponent("readme.txt"))
+        try Data("const express = require(\"express\");\n".utf8).write(to: app.appendingPathComponent("server.cjs"))
+        try Data("{\"name\":\"ipalens-fixture\",\"private\":true}\n".utf8).write(to: app.appendingPathComponent("package.json"))
+        try Data("def inspect_package(path):\n    return path\n".utf8).write(to: app.appendingPathComponent("tool.py"))
+        try Data("<html><body><script>const ready = true;</script></body></html>\n".utf8).write(to: app.appendingPathComponent("Page.html"))
+        try Data("final class View { String title = \"IPALens\"; }\n".utf8).write(to: app.appendingPathComponent("View.java"))
+        try Data("struct Feature { let enabled = true }\n".utf8).write(to: app.appendingPathComponent("Feature.swift"))
+        try Data(String(repeating: "let expandedValue = 1\n", count: 100).utf8).write(to: app.appendingPathComponent("large.swift"))
+        try Data("#!/usr/bin/env node\nconsole.log(\"IPALens\");\n".utf8).write(to: app.appendingPathComponent("run-node"))
+        try Data("readable content with an uncommon extension\n".utf8).write(to: app.appendingPathComponent("notes.weirdsource"))
+        try Data([0x00, 0x01, 0x02, 0xFF, 0x10]).write(to: app.appendingPathComponent("blob.weirdsource"))
         try wavSilence().write(to: app.appendingPathComponent("tone.wav"))
+        try mp4Stub().write(to: app.appendingPathComponent("tone.m4a"))
         try mp4Stub().write(to: app.appendingPathComponent("clip.mp4"))
         try writePlist(
             ["NSPrivacyTracking": false, "NSPrivacyCollectedDataTypes": []],

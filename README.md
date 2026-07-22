@@ -13,7 +13,9 @@ IPALens is a fast, read-only browser for iOS `.ipa` packages. Its data-only plug
 IPALens v1.0.0 is the first stable release of the package explorer.
 
 - Finder-style package browsing with filename and optional content search
-- Structured previews for property lists, images, text, audio, video, Mach-O binaries, and provisioning profiles
+- Structured previews for property lists, images, audio—including M4A—video, Mach-O binaries, and provisioning profiles
+- Xcode-style, syntax-colored source previews across common programming, web, markup, data, shell, and configuration formats
+- Progressive source expansion and a file tree that preserves its selection and expanded folders between inspection sections
 - App metadata, permissions, URL schemes, privacy manifests, frameworks, extensions, and dynamic libraries
 - Code-signing, certificate, provisioning-profile, and entitlement inspection
 - Markdown and versioned JSON reports
