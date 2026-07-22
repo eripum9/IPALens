@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import IPALensPluginKit
 import UniformTypeIdentifiers
 
 private func runBlocking<T: Sendable>(
@@ -16,71 +17,87 @@ private func runBlocking<T: Sendable>(
     }
 }
 
-public actor IPAInspectionEngine {
+public actor PackageInspectionEngine {
     public typealias ProgressHandler = @Sendable (InspectionProgress) -> Void
 
     private var indexes: [URL: ArchiveIndex] = [:]
+    private var preparedSources: [URL: PreparedPackageSource] = [:]
     private var mediaPreviewFiles: [URL: [String: URL]] = [:]
     private let previewRoot: URL
 
     public init() {
+        ContainerPreparer.sweepStaleSessions()
         previewRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("IPALens", isDirectory: true)
             .appendingPathComponent("Media-\(UUID().uuidString)", isDirectory: true)
     }
 
     deinit {
+        for prepared in preparedSources.values {
+            ContainerPreparer.cleanup(prepared)
+        }
         try? FileManager.default.removeItem(at: previewRoot)
     }
 
     public func index(
         url: URL,
+        plugin: PluginManifestV1? = nil,
         progress: ProgressHandler? = nil,
         now: Date = Date()
-    ) async throws -> IPAPackageSnapshot {
+    ) async throws -> PackageSnapshot {
         progress?(.init(phase: .indexing, completed: 0, total: 1, message: "Reading package directory"))
         try Task.checkCancellation()
-        let archiveIndex = try await runBlocking {
-            try ArchiveIndexer.build(url: url)
+        let prepared = try await runBlocking {
+            try ContainerPreparer.prepare(url: url, plugin: plugin)
         }
-        indexes[cacheKey(url)] = archiveIndex
-        let fileSize = try sourceFileSize(url)
+        let key = cacheKey(url)
+        if let previous = preparedSources[key] { ContainerPreparer.cleanup(previous) }
+        preparedSources[key] = prepared
+        indexes[key] = prepared.index
+        let fileSize = try sourceSize(url, prepared: prepared)
         progress?(.init(phase: .indexing, completed: 1, total: 1, message: "Package index ready"))
 
-        return IPAPackageSnapshot(
+        return PackageSnapshot(
             sourceFileName: url.lastPathComponent,
             sourceFileSize: fileSize,
             packageSHA256: nil,
             generatedAt: now,
-            entries: archiveIndex.entries,
+            entries: prepared.index.entries,
             appBundles: [],
             signing: [],
             issues: [],
-            isFullyInspected: false
+            isFullyInspected: false,
+            sourceKind: prepared.sourceKind,
+            platform: prepared.platform,
+            plugin: prepared.plugin
         )
     }
 
     public func inspect(
         url: URL,
-        indexedSnapshot: IPAPackageSnapshot? = nil,
+        indexedSnapshot: PackageSnapshot? = nil,
+        plugin: PluginManifestV1? = nil,
         progress: ProgressHandler? = nil,
         now: Date = Date()
-    ) async throws -> IPAPackageSnapshot {
+    ) async throws -> PackageSnapshot {
         let key = cacheKey(url)
         let initialIndex: ArchiveIndex
         if let cached = indexes[key] {
             initialIndex = cached
         } else {
-            _ = try await index(url: url, progress: progress, now: now)
+            _ = try await index(url: url, plugin: plugin, progress: progress, now: now)
             guard let cached = indexes[key] else { throw IPAInspectionError.unreadableArchive }
             initialIndex = cached
         }
+        guard let prepared = preparedSources[key] else { throw IPAInspectionError.unreadableArchive }
 
         try Task.checkCancellation()
         progress?(.init(phase: .hashing, completed: 0, total: 1, message: "Calculating package fingerprint"))
         let (packageHash, hashedIndex) = try await runBlocking(priority: .utility) {
-            let packageHash = try SHA256.hash(fileAt: url)
             let hashedIndex = try ArchiveIndexer.hashEntries(url: url, index: initialIndex, progress: progress)
+            let packageHash = prepared.sourceKind == .applicationBundle
+                ? Self.directoryFingerprint(index: hashedIndex, plugin: prepared.plugin)
+                : try SHA256.hash(fileAt: url)
             return (packageHash, hashedIndex)
         }
         indexes[key] = hashedIndex
@@ -88,7 +105,7 @@ public actor IPAInspectionEngine {
         try Task.checkCancellation()
         progress?(.init(phase: .metadata, completed: 0, total: 1, message: "Reading application metadata"))
         let metadata = try await runBlocking(priority: .utility) {
-            MetadataInspector.inspectBundles(url: url, index: hashedIndex)
+            MetadataInspector.inspectBundles(url: url, index: hashedIndex, platform: prepared.definition)
         }
         var issues = metadata.issues
         let unhashedCount = hashedIndex.entries.filter { $0.kind == .file && $0.sha256 == nil }.count
@@ -148,8 +165,8 @@ public actor IPAInspectionEngine {
             message: "Code-signing inspection complete"
         ))
 
-        let inspectedSourceSize = try indexedSnapshot?.sourceFileSize ?? sourceFileSize(url)
-        let snapshot = IPAPackageSnapshot(
+        let inspectedSourceSize = try indexedSnapshot?.sourceFileSize ?? sourceSize(url, prepared: prepared)
+        let snapshot = PackageSnapshot(
             sourceFileName: indexedSnapshot?.sourceFileName ?? url.lastPathComponent,
             sourceFileSize: inspectedSourceSize,
             packageSHA256: packageHash,
@@ -158,7 +175,10 @@ public actor IPAInspectionEngine {
             appBundles: metadata.bundles,
             signing: signingResults,
             issues: issues,
-            isFullyInspected: true
+            isFullyInspected: true,
+            sourceKind: prepared.sourceKind,
+            platform: prepared.platform,
+            plugin: prepared.plugin
         )
         progress?(.init(phase: .complete, completed: 1, total: 1, message: "Inspection complete"))
         return snapshot
@@ -358,6 +378,9 @@ public actor IPAInspectionEngine {
     public func forget(url: URL) {
         let key = cacheKey(url)
         indexes.removeValue(forKey: key)
+        if let prepared = preparedSources.removeValue(forKey: key) {
+            ContainerPreparer.cleanup(prepared)
+        }
         if let previews = mediaPreviewFiles.removeValue(forKey: key) {
             for previewURL in previews.values {
                 try? FileManager.default.removeItem(at: previewURL)
@@ -368,24 +391,43 @@ public actor IPAInspectionEngine {
     private func cachedOrBuildIndex(_ url: URL) throws -> ArchiveIndex {
         let key = cacheKey(url)
         if let cached = indexes[key] { return cached }
-        let built = try ArchiveIndexer.build(url: url)
-        indexes[key] = built
-        return built
+        let prepared = try ContainerPreparer.prepare(url: url, plugin: nil)
+        indexes[key] = prepared.index
+        preparedSources[key] = prepared
+        return prepared.index
     }
 
     private func cacheKey(_ url: URL) -> URL {
         url.standardizedFileURL.resolvingSymlinksInPath()
     }
 
-    private func sourceFileSize(_ url: URL) throws -> Int64 {
+    private func sourceSize(_ url: URL, prepared: PreparedPackageSource) throws -> Int64 {
+        if prepared.sourceKind == .applicationBundle {
+            return prepared.index.totalUncompressedSize
+        }
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
         return Int64(values.fileSize ?? 0)
+    }
+
+    private nonisolated static func directoryFingerprint(
+        index: ArchiveIndex,
+        plugin: PluginReference?
+    ) -> String {
+        var hasher = SHA256()
+        if let plugin {
+            hasher.update(data: Data("plugin:\(plugin.id)@\(plugin.version)\n".utf8))
+        }
+        for entry in index.entries.sorted(by: { $0.path < $1.path }) {
+            let line = "\(entry.path)\0\(entry.kind.rawValue)\0\(entry.uncompressedSize)\0\(entry.sha256 ?? "-")\n"
+            hasher.update(data: Data(line.utf8))
+        }
+        return hasher.finalize().hexString
     }
 
     private func materializeMediaEntry(
         archiveURL: URL,
         index: ArchiveIndex,
-        entry: IPAEntry,
+        entry: PackageEntry,
         entryPath: String
     ) async throws -> URL {
         let sourceKey = cacheKey(archiveURL)
@@ -412,7 +454,7 @@ public actor IPAInspectionEngine {
     private nonisolated static func hexPreview(
         url: URL,
         index: ArchiveIndex,
-        entry: IPAEntry,
+        entry: PackageEntry,
         offset: Int64
     ) throws -> PreviewPayload {
         guard offset >= 0, offset < max(1, entry.uncompressedSize) else {
@@ -517,3 +559,6 @@ public actor IPAInspectionEngine {
         }
     }
 }
+
+@available(*, deprecated, renamed: "PackageInspectionEngine")
+public typealias IPAInspectionEngine = PackageInspectionEngine

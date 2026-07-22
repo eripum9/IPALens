@@ -1,4 +1,5 @@
 import IPALensCore
+import IPALensPluginKit
 import SwiftUI
 
 @main
@@ -18,24 +19,36 @@ struct IPALensApplication: App {
         }
 
         Settings {
+            IPALensSettingsView()
+        }
+    }
+}
+
+private struct IPALensSettingsView: View {
+    var body: some View {
+        TabView {
             VStack(alignment: .leading, spacing: 12) {
                 Text("IPALens")
                     .font(.title2.bold())
-                Text("Native IPA Package Explorer for macOS")
+                Text("Native App Package Explorer for macOS")
                 Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()
-                Label("Runs entirely offline", systemImage: "network.slash")
-                Label("Never modifies source packages", systemImage: "lock")
-                Label("No accounts, uploads, or telemetry", systemImage: "eye.slash")
+                Label("Inspections stay on this Mac", systemImage: "lock")
+                Label("Never modifies source packages", systemImage: "doc.badge.ellipsis")
+                Label("GitHub access is used only for plugin actions", systemImage: "network")
                 Text("IPALens reports observable package evidence and does not make malware or safety claims.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             .padding(24)
-            .frame(width: 420)
+            .tabItem { Label("General", systemImage: "gearshape") }
+
+            PluginSettingsView()
+                .tabItem { Label("Plugins", systemImage: "puzzlepiece.extension") }
         }
+        .frame(width: 680, height: 520)
     }
 }
 
@@ -89,7 +102,7 @@ struct IPALensCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
-            Button("Open IPA…") { openIPAAction?.perform() }
+            Button("Open Package…") { openIPAAction?.perform() }
                 .keyboardShortcut("o")
                 .disabled(openIPAAction == nil)
         }

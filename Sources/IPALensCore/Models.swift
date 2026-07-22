@@ -1,4 +1,45 @@
 import Foundation
+import IPALensPluginKit
+
+public enum PackageSourceKind: String, Codable, Sendable, Hashable {
+    case ipaArchive
+    case zipArchive
+    case applicationBundle
+    case diskImage
+    case installerPackage
+
+    public var displayName: String {
+        switch self {
+        case .ipaArchive: "IPA archive"
+        case .zipArchive: "ZIP archive"
+        case .applicationBundle: "Application bundle"
+        case .diskImage: "Disk image"
+        case .installerPackage: "Installer package"
+        }
+    }
+}
+
+public enum PlatformIdentifier: String, Codable, Sendable, Hashable {
+    case iOS = "ios"
+    case macOS = "macos"
+
+    public var displayName: String {
+        switch self {
+        case .iOS: "iOS"
+        case .macOS: "macOS"
+        }
+    }
+}
+
+public struct PluginReference: Codable, Sendable, Hashable {
+    public let id: String
+    public let version: String
+
+    public init(id: String, version: String) {
+        self.id = id
+        self.version = version
+    }
+}
 
 public enum IPAEntryKind: String, Codable, Sendable, Hashable {
     case file
@@ -6,7 +47,7 @@ public enum IPAEntryKind: String, Codable, Sendable, Hashable {
     case symbolicLink
 }
 
-public struct IPAEntry: Identifiable, Codable, Sendable, Hashable {
+public struct PackageEntry: Identifiable, Codable, Sendable, Hashable {
     public var id: String { path }
 
     public let path: String
@@ -371,17 +412,20 @@ public struct InspectionIssue: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
-public struct IPAPackageSnapshot: Codable, Sendable, Hashable {
+public struct PackageSnapshot: Codable, Sendable, Hashable {
     public let schemaVersion: Int
     public let sourceFileName: String
     public let sourceFileSize: Int64
     public let packageSHA256: String?
     public let generatedAt: Date
-    public let entries: [IPAEntry]
+    public let entries: [PackageEntry]
     public let appBundles: [AppBundleSummary]
     public let signing: [SigningSummary]
     public let issues: [InspectionIssue]
     public let isFullyInspected: Bool
+    public let sourceKind: PackageSourceKind?
+    public let platform: PlatformIdentifier?
+    public let plugin: PluginReference?
 
     public init(
         schemaVersion: Int = 1,
@@ -389,11 +433,14 @@ public struct IPAPackageSnapshot: Codable, Sendable, Hashable {
         sourceFileSize: Int64,
         packageSHA256: String?,
         generatedAt: Date,
-        entries: [IPAEntry],
+        entries: [PackageEntry],
         appBundles: [AppBundleSummary],
         signing: [SigningSummary],
         issues: [InspectionIssue],
-        isFullyInspected: Bool
+        isFullyInspected: Bool,
+        sourceKind: PackageSourceKind? = nil,
+        platform: PlatformIdentifier? = nil,
+        plugin: PluginReference? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.sourceFileName = sourceFileName
@@ -405,8 +452,17 @@ public struct IPAPackageSnapshot: Codable, Sendable, Hashable {
         self.signing = signing
         self.issues = issues
         self.isFullyInspected = isFullyInspected
+        self.sourceKind = sourceKind
+        self.platform = platform
+        self.plugin = plugin
     }
 }
+
+@available(*, deprecated, renamed: "PackageEntry")
+public typealias IPAEntry = PackageEntry
+
+@available(*, deprecated, renamed: "PackageSnapshot")
+public typealias IPAPackageSnapshot = PackageSnapshot
 
 public enum InspectionPhase: String, Codable, Sendable, Hashable {
     case indexing
@@ -568,6 +624,10 @@ public enum IPAInspectionError: LocalizedError, Sendable {
     case entryNotFound(String)
     case extractionFailed(String)
     case insufficientDiskSpace(required: Int64, available: Int64)
+    case requiredPluginMissing(String)
+    case unsupportedSourceType(String)
+    case encryptedDiskImageUnsupported
+    case containerToolFailed(String, String)
 
     public var errorDescription: String? {
         switch self {
@@ -580,6 +640,14 @@ public enum IPAInspectionError: LocalizedError, Sendable {
         case .extractionFailed(let detail): "IPALens could not extract this archive entry: \(detail)"
         case .insufficientDiskSpace(let required, let available):
             "Not enough temporary disk space. IPALens needs \(ByteCountFormatter.string(fromByteCount: required, countStyle: .file)); \(ByteCountFormatter.string(fromByteCount: available, countStyle: .file)) is available."
+        case .requiredPluginMissing:
+            "macOS App Support is required to inspect this source."
+        case .unsupportedSourceType(let value):
+            "IPALens does not support the .\(value) source type."
+        case .encryptedDiskImageUnsupported:
+            "Encrypted disk images are not supported. IPALens never requests or stores disk-image passwords."
+        case .containerToolFailed(let tool, let detail):
+            "\(tool) could not prepare this source: \(detail)"
         }
     }
 }

@@ -8,6 +8,7 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
+        .library(name: "IPALensPluginKit", targets: ["IPALensPluginKit"]),
         .library(name: "IPALensCore", targets: ["IPALensCore"]),
         .executable(name: "IPALens", targets: ["IPALens"])
     ],
@@ -19,20 +20,35 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "IPALensPluginKit",
+            dependencies: [
+                .product(name: "ZIPFoundation", package: "ZIPFoundation")
+            ]
+        ),
+        .target(
             name: "IPALensCore",
             dependencies: [
+                "IPALensPluginKit",
                 .product(name: "ZIPFoundation", package: "ZIPFoundation")
             ]
         ),
         .executableTarget(
             name: "IPALens",
-            dependencies: ["IPALensCore"],
+            dependencies: ["IPALensCore", "IPALensPluginKit"],
             path: "Sources/IPALensApp"
         ),
         .testTarget(
             name: "IPALensCoreTests",
             dependencies: [
                 "IPALensCore",
+                "IPALensPluginKit",
+                .product(name: "ZIPFoundation", package: "ZIPFoundation")
+            ]
+        ),
+        .testTarget(
+            name: "IPALensPluginKitTests",
+            dependencies: [
+                "IPALensPluginKit",
                 .product(name: "ZIPFoundation", package: "ZIPFoundation")
             ]
         )

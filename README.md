@@ -4,9 +4,9 @@
 
 # IPALens
 
-**Native IPA Package Explorer for macOS**
+**Native App Package Explorer for macOS**
 
-IPALens is a fast, offline, read-only browser for iOS `.ipa` packages. Explore the complete package hierarchy, preview common file formats, inspect app and signing metadata, and export reproducible reports—without uploading or executing package contents.
+IPALens is a fast, read-only browser for iOS `.ipa` packages. Its data-only plugin system can add platform layouts without loading third-party executable code. The first official plugin adds inspection of macOS `.app`, `.zip`, `.dmg`, and `.pkg` sources.
 
 ## v1.0.0
 
@@ -19,16 +19,26 @@ IPALens v1.0.0 is the first stable release of the package explorer.
 - Markdown and versioned JSON reports
 - Hash-verified export of individual package files
 - Native Universal 2 support for Intel and Apple Silicon Macs
+- Signed, data-only plugins with official, third-party, and local source controls
+- Optional macOS App Support for app bundles, ZIP archives, disk images, and installer packages
 
 ## Privacy and safety
 
-IPALens treats every IPA as untrusted input.
+IPALens treats every package and plugin as untrusted input.
 
-- Works entirely offline with no accounts, uploads, telemetry, or AI services
-- Opens source IPAs read-only and never executes package contents
+- Performs inspections locally with no accounts, uploads, telemetry, or AI services
+- Connects only to approved plugin catalogs when the Plugins screen opens, you check manually, or you approve a required-plugin offer
+- Installed plugins work offline and contain data only—no binaries or scripts
+- Opens source packages read-only and never executes package contents or installer scripts
 - Blocks unsafe archive paths, duplicate normalized paths, and oversized archives
 - Never follows or materializes symbolic links
 - Reports observable evidence without making malware or safety claims
+
+## Plugins
+
+iOS App Support is built in and cannot be removed. Official macOS App Support is distributed from the separate [IPALens-Plugins repository](https://github.com/eripum9/IPALens-Plugins) and is verified with an Ed25519 signature plus SHA-256 before atomic installation.
+
+Third-party catalogs require an HTTPS URL and explicit key-fingerprint approval. Local unsigned plugins require a separate warning and confirmation. Neither is controlled or reviewed by the IPALens project.
 
 ## Requirements
 
@@ -60,12 +70,13 @@ ditto dist/IPALens.app /Applications/IPALens.app
 ## Architecture
 
 - `IPALensCore` contains archive validation, inspection, previews, search, reports, and reusable data models.
+- `IPALensPluginKit` contains signed catalog verification, plugin-package validation, trust management, and isolated installation.
 - `IPALens` is the native SwiftUI macOS interface.
 - ZIP handling uses [ZIPFoundation 0.9.20](https://github.com/weichsel/ZIPFoundation).
 
 ## Roadmap
 
-Trust Diff is planned for a future release. It will compare original and modified IPA snapshots using file hashes and semantic metadata while preserving IPALens’s evidence-only approach.
+Trust Diff is planned for a future release. It will compare original and modified package snapshots using file hashes and semantic metadata while preserving IPALens’s evidence-only approach.
 
 Editing, injection, re-signing, IPA downloading, installation, decompilation, dynamic analysis, and malware verdicts remain outside the core explorer’s scope.
 

@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import IPALensCore
+import IPALensPluginKit
 import UniformTypeIdentifiers
 
 enum SidebarSection: String, CaseIterable, Identifiable {
@@ -31,7 +32,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
 }
 
 struct FileTreeNode: Identifiable, Hashable, Sendable {
-    let entry: IPAEntry
+    let entry: PackageEntry
     let children: [FileTreeNode]?
     var id: String { entry.path }
 }
@@ -39,12 +40,17 @@ struct FileTreeNode: Identifiable, Hashable, Sendable {
 extension UTType {
     static let ipaPackage = UTType(filenameExtension: "ipa")
         ?? UTType(importedAs: "com.apple.itunes.ipa", conformingTo: .data)
+    static let macApplicationBundle = UTType.applicationBundle
+    static let diskImage = UTType(filenameExtension: "dmg")
+        ?? UTType(importedAs: "com.apple.disk-image-udif", conformingTo: .data)
+    static let installerPackage = UTType(filenameExtension: "pkg")
+        ?? UTType(importedAs: "com.apple.installer-package-archive", conformingTo: .data)
 }
 
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var sourceURL: URL?
-    @Published var snapshot: IPAPackageSnapshot?
+    @Published var snapshot: PackageSnapshot?
     @Published var selectedSection: SidebarSection = .files
     @Published var selectedEntryPath: String? {
         didSet { schedulePreview() }
@@ -67,26 +73,37 @@ final class WorkspaceModel: ObservableObject {
     }
     @Published var searchResults: [SearchResult] = []
     @Published var errorMessage: String?
+    @Published var pluginRequiredURL: URL?
+    @Published var isInstallingPlugin = false
+    @Published var pluginInstallMessage = "Preparing macOS App Support"
 
-    private let engine = IPAInspectionEngine()
+    private let engine = PackageInspectionEngine()
+    private let pluginManager = PluginManager.shared
     private var loadTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
-    private var entriesByPath: [String: IPAEntry] = [:]
+    private var pluginInstallTask: Task<Void, Never>?
+    private var entriesByPath: [String: PackageEntry] = [:]
     private var loadGeneration = UUID()
     private var previewGeneration = UUID()
     private var searchGeneration = UUID()
     private var hasSecurityScope = false
+    private var activePluginID: String?
     nonisolated(unsafe) private var securityScopedURL: URL?
 
     deinit {
         loadTask?.cancel()
         previewTask?.cancel()
         searchTask?.cancel()
+        pluginInstallTask?.cancel()
         securityScopedURL?.stopAccessingSecurityScopedResource()
+        if let activePluginID {
+            let manager = pluginManager
+            Task { await manager.endUsing(pluginID: activePluginID) }
+        }
     }
 
-    var selectedEntry: IPAEntry? {
+    var selectedEntry: PackageEntry? {
         guard let path = selectedEntryPath else { return nil }
         return entriesByPath[path]
     }
@@ -107,28 +124,102 @@ final class WorkspaceModel: ObservableObject {
 
     func presentOpenPanel() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.ipaPackage]
         panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.message = "Choose an IPA package. IPALens inspects it locally without modifying the source file."
+        panel.canChooseDirectories = true
+        panel.treatsFilePackagesAsDirectories = false
+        panel.allowedContentTypes = [
+            .ipaPackage,
+            .macApplicationBundle,
+            .zip,
+            .diskImage,
+            .installerPackage
+        ]
+        panel.message = "Choose an IPA or macOS app source. IPALens inspects it without modifying the original."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         open(url: url)
     }
 
     func open(url: URL) {
-        guard url.pathExtension.lowercased() == "ipa" else {
-            errorMessage = "IPALens opens files with the .ipa extension."
+        let fileExtension = url.pathExtension.lowercased()
+        let supported = ["ipa", "app", "zip", "dmg", "pkg", "mpkg"]
+        guard supported.contains(fileExtension) else {
+            errorMessage = "IPALens opens IPA, app, ZIP, DMG, and PKG sources."
             return
         }
+        if fileExtension != "ipa" {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    if let installation = try await pluginManager.installedPlugin(id: PluginManager.macOSPluginID) {
+                        openResolved(url: url, plugin: installation.manifest)
+                    } else {
+                        pluginRequiredURL = url
+                    }
+                } catch {
+                    errorMessage = error.localizedDescription
+                }
+            }
+            return
+        }
+        openResolved(url: url, plugin: nil)
+    }
+
+    func dismissPluginOffer() {
+        pluginRequiredURL = nil
+    }
+
+    func installRequiredPlugin() {
+        guard let pendingURL = pluginRequiredURL else { return }
+        isInstallingPlugin = true
+        pluginInstallMessage = "Fetching the official plugin catalog"
+        pluginInstallTask?.cancel()
+        pluginInstallTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let source = try await pluginManager.officialSource()
+                let catalog = try await pluginManager.fetchCatalog(from: source)
+                guard let entry = catalog.payload.plugins.first(where: { $0.id == PluginManager.macOSPluginID }) else {
+                    throw PluginError.pluginNotFound
+                }
+                pluginInstallMessage = "Downloading and verifying macOS App Support"
+                let installation = try await pluginManager.install(entry: entry, from: source)
+                pluginRequiredURL = nil
+                isInstallingPlugin = false
+                openResolved(url: pendingURL, plugin: installation.manifest)
+            } catch is CancellationError {
+                isInstallingPlugin = false
+            } catch {
+                isInstallingPlugin = false
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func cancelPluginInstallation() {
+        pluginInstallTask?.cancel()
+        pluginInstallTask = nil
+        isInstallingPlugin = false
+        pluginRequiredURL = nil
+    }
+
+    private func openResolved(url: URL, plugin: PluginManifestV1?) {
         loadTask?.cancel()
         previewTask?.cancel()
         searchTask?.cancel()
         if let previousURL = sourceURL {
             Task { await self.engine.forget(url: previousURL) }
         }
+        if let activePluginID {
+            Task { await pluginManager.endUsing(pluginID: activePluginID) }
+            self.activePluginID = nil
+        }
         releaseSecurityScope()
 
         sourceURL = url
+        if let plugin {
+            activePluginID = plugin.id
+            Task { await pluginManager.beginUsing(pluginID: plugin.id) }
+        }
         hasSecurityScope = url.startAccessingSecurityScopedResource()
         securityScopedURL = hasSecurityScope ? url : nil
         snapshot = nil
@@ -152,13 +243,13 @@ final class WorkspaceModel: ObservableObject {
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let handler: IPAInspectionEngine.ProgressHandler = { [weak self] value in
+                let handler: PackageInspectionEngine.ProgressHandler = { [weak self] value in
                     Task { @MainActor in
                         guard self?.loadGeneration == generation else { return }
                         self?.progress = value
                     }
                 }
-                let indexed = try await inspectionEngine.index(url: url, progress: handler)
+                let indexed = try await inspectionEngine.index(url: url, plugin: plugin, progress: handler)
                 guard !Task.isCancelled, loadGeneration == generation else { return }
                 snapshot = indexed
                 await buildTree(from: indexed.entries)
@@ -168,6 +259,7 @@ final class WorkspaceModel: ObservableObject {
                 let inspected = try await inspectionEngine.inspect(
                     url: url,
                     indexedSnapshot: indexed,
+                    plugin: plugin,
                     progress: handler
                 )
                 guard !Task.isCancelled, loadGeneration == generation else { return }
@@ -202,12 +294,13 @@ final class WorkspaceModel: ObservableObject {
     func exportReport() {
         guard let snapshot else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = snapshot.sourceFileName.replacingOccurrences(of: ".ipa", with: "") + "-inspection.md"
+        panel.nameFieldStringValue = URL(fileURLWithPath: snapshot.sourceFileName)
+            .deletingPathExtension().lastPathComponent + "-inspection.md"
         panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText, .json]
         panel.message = "Save this inspection as a readable Markdown report or versioned JSON data."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            let report = InspectionReportV1(snapshot: snapshot)
+            let report = InspectionReportV2(snapshot: snapshot)
             if url.pathExtension.lowercased() == "json" {
                 try report.jsonData().write(to: url, options: .atomic)
             } else {
@@ -310,11 +403,11 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    private func buildTree(from entries: [IPAEntry]) async {
+    private func buildTree(from entries: [PackageEntry]) async {
         isTreeLoading = true
         let structureTask = Task.detached(priority: .userInitiated) {
             let byPath = Dictionary(uniqueKeysWithValues: entries.map { ($0.path, $0) })
-            func build(_ entry: IPAEntry) -> FileTreeNode {
+            func build(_ entry: PackageEntry) -> FileTreeNode {
                 let children = entry.childPaths.compactMap { byPath[$0] }.map(build)
                 return FileTreeNode(entry: entry, children: children.isEmpty ? nil : children)
             }

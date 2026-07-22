@@ -111,6 +111,31 @@ struct RootView: View {
         } message: {
             Text(model.errorMessage ?? "An unknown error occurred.")
         }
+        .alert("macOS App Support Required", isPresented: Binding(
+            get: { model.pluginRequiredURL != nil },
+            set: { if !$0 { model.dismissPluginOffer() } }
+        )) {
+            Button("Install") { model.installRequiredPlugin() }
+            Button("Not Now", role: .cancel) { model.dismissPluginOffer() }
+        } message: {
+            Text("This source requires the official macOS App Support plugin. IPALens will download, verify, and install it from GitHub after you confirm.")
+        }
+        .overlay {
+            if model.isInstallingPlugin {
+                VStack(spacing: 16) {
+                    ClassicActivityIndicator(size: 52)
+                    Text(model.pluginInstallMessage)
+                        .font(.headline)
+                    Text("The plugin is verified before it becomes active.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Cancel", role: .cancel, action: model.cancelPluginInstallation)
+                }
+                .padding(28)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .shadow(radius: 18, y: 8)
+            }
+        }
     }
 }
 
@@ -126,12 +151,12 @@ private struct WelcomeView: View {
             VStack(spacing: 8) {
                 Text("IPALens")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
-                Text("Inspect IPA packages privately on your Mac")
+                Text("Inspect iOS and macOS app packages privately")
                     .foregroundStyle(.secondary)
             }
-            Text("Drop an IPA here, or choose one to begin")
+            Text("Drop an app package here, or choose one to begin")
                 .font(.title3)
-            Button("Open IPA…", action: model.presentOpenPanel)
+            Button("Open Package…", action: model.presentOpenPanel)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut("o")
@@ -200,7 +225,7 @@ private struct ExplorerView: View {
                 }
 
                 Button(action: model.presentOpenPanel) {
-                    Label("Open IPA", systemImage: "folder.badge.plus")
+                    Label("Open Package", systemImage: "folder.badge.plus")
                 }
 
                 Menu {
@@ -239,7 +264,7 @@ private struct SidebarView: View {
 
     var body: some View {
         List(SidebarSection.allCases, selection: $model.selectedSection) { section in
-            Label(section.rawValue, systemImage: section.symbol)
+            Label(title(for: section), systemImage: section.symbol)
                 .tag(section)
         }
         .safeAreaInset(edge: .bottom) {
@@ -262,6 +287,13 @@ private struct SidebarView: View {
             .padding(12)
             .background(.bar)
         }
+    }
+
+    private func title(for section: SidebarSection) -> String {
+        if model.snapshot?.platform == .macOS, section == .extensions {
+            return "Components"
+        }
+        return section.rawValue
     }
 }
 
@@ -353,7 +385,7 @@ private struct FileBrowserView: View {
 }
 
 private struct EntryRow: View {
-    let entry: IPAEntry
+    let entry: PackageEntry
 
     var body: some View {
         HStack {

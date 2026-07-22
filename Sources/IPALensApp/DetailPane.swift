@@ -254,7 +254,10 @@ private struct OverviewDetail: View {
                     LabeledContent("Bundle ID", value: bundle.bundleIdentifier ?? "Unknown")
                     LabeledContent("Version", value: bundle.version ?? "Unknown")
                     LabeledContent("Build", value: bundle.build ?? "Unknown")
-                    LabeledContent("Minimum iOS", value: bundle.minimumOSVersion ?? "Unknown")
+                    LabeledContent(
+                        snapshot.platform == .macOS ? "Minimum macOS" : "Minimum iOS",
+                        value: bundle.minimumOSVersion ?? "Unknown"
+                    )
                     LabeledContent("Executable", value: bundle.executableName ?? "Unknown")
                 }
                 Section("Package") {

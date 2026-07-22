@@ -1,11 +1,51 @@
 import Foundation
 
+public struct InspectionReportV2: Codable, Sendable, Hashable {
+    public let schemaVersion: Int
+    public let generatedAt: Date
+    public let package: PackageSnapshot
+
+    public init(snapshot: PackageSnapshot) {
+        schemaVersion = 2
+        generatedAt = snapshot.generatedAt
+        package = snapshot
+    }
+
+    public func jsonData(prettyPrinted: Bool = true) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = prettyPrinted
+            ? [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            : [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(self)
+    }
+
+    public func markdown() -> String {
+        let v1 = InspectionReportV1(snapshot: package).markdown()
+        var context: [String] = []
+        if let platform = package.platform {
+            context.append("- **Platform:** \(platform.displayName)")
+        }
+        if let sourceKind = package.sourceKind {
+            context.append("- **Source type:** \(sourceKind.displayName)")
+        }
+        if let plugin = package.plugin {
+            context.append("- **Platform plugin:** `\(plugin.id)` \(plugin.version)")
+        } else {
+            context.append("- **Platform support:** Built in")
+        }
+        guard let packageRange = v1.range(of: "- **Package:") else { return v1 }
+        let insertion = String(v1[..<packageRange.lowerBound]) + context.joined(separator: "\n") + "\n"
+        return insertion + String(v1[packageRange.lowerBound...])
+    }
+}
+
 public struct InspectionReportV1: Codable, Sendable, Hashable {
     public let schemaVersion: Int
     public let generatedAt: Date
-    public let package: IPAPackageSnapshot
+    public let package: PackageSnapshot
 
-    public init(snapshot: IPAPackageSnapshot) {
+    public init(snapshot: PackageSnapshot) {
         schemaVersion = 1
         generatedAt = snapshot.generatedAt
         package = snapshot
@@ -39,7 +79,8 @@ public struct InspectionReportV1: Codable, Sendable, Hashable {
             lines.append("- **Bundle path:** `\(inlineCode(bundle.bundlePath))`")
             lines.append("- **Bundle ID:** `\(inlineCode(bundle.bundleIdentifier ?? "Unknown"))`")
             lines.append("- **Version:** \(escaped(bundle.version ?? "Unknown")) (\(escaped(bundle.build ?? "Unknown")))")
-            lines.append("- **Minimum iOS:** \(escaped(bundle.minimumOSVersion ?? "Unknown"))")
+            let minimumLabel = package.platform == .macOS ? "Minimum macOS" : "Minimum iOS"
+            lines.append("- **\(minimumLabel):** \(escaped(bundle.minimumOSVersion ?? "Unknown"))")
             lines.append("- **Executable:** `\(inlineCode(bundle.executableName ?? "Unknown"))`")
             lines.append("")
 

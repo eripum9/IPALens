@@ -156,6 +156,10 @@ enum BundleMaterializer {
         bundlePath: String,
         body: (URL) throws -> T
     ) throws -> T {
+        if let physicalBundleURL = index.physicalPaths[bundlePath] {
+            return try body(physicalBundleURL)
+        }
+
         let requiredBytes = index.entries
             .filter { $0.path == bundlePath || $0.path.hasPrefix(bundlePath + "/") }
             .reduce(Int64(0)) { $0 + $1.uncompressedSize }
@@ -175,7 +179,7 @@ enum BundleMaterializer {
         try fileManager.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: temporaryRoot) }
 
-        let archive = try Archive(url: archiveURL, accessMode: .read)
+        let archive = try Archive(url: index.archiveURL ?? archiveURL, accessMode: .read)
 
         let subtree = index.entries.filter { $0.path == bundlePath || $0.path.hasPrefix(bundlePath + "/") }
         for entry in subtree {

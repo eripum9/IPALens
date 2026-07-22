@@ -1,4 +1,5 @@
 import Foundation
+import IPALensPluginKit
 
 enum PropertyListParser {
     static func object(data: Data) throws -> Any {
@@ -26,15 +27,32 @@ enum MetadataInspector {
         let issues: [InspectionIssue]
     }
 
-    static func inspectBundles(url: URL, index: ArchiveIndex) -> Result {
+    static func inspectBundles(
+        url: URL,
+        index: ArchiveIndex,
+        platform: PlatformDefinitionV1 = .iOS
+    ) -> Result {
         let infoPlistPaths = index.entries
             .filter { entry in
-                let components = entry.path.split(separator: "/")
-                return entry.kind == .file &&
-                    components.count == 3 &&
-                    components[0] == "Payload" &&
-                    components[1].hasSuffix(".app") &&
-                    components[2] == "Info.plist"
+                guard entry.kind == .file, entry.name == "Info.plist" else { return false }
+                if platform.platformIdentifier == "ios" {
+                    let components = entry.path.split(separator: "/")
+                    return components.count == 3 &&
+                        components[0] == "Payload" &&
+                        components[1].hasSuffix(platform.appBundleSuffix)
+                }
+                let suffix = "/" + platform.infoPlistRelativePath
+                guard entry.path.hasSuffix(suffix) else { return false }
+                let bundlePath = String(entry.path.dropLast(suffix.count))
+                guard bundlePath.hasSuffix(platform.appBundleSuffix) else { return false }
+                let prefix = bundlePath + "/"
+                return !index.entries.contains {
+                    $0.kind == .directory &&
+                        $0.path != bundlePath &&
+                        bundlePath.hasPrefix($0.path + "/") &&
+                        $0.path.hasSuffix(platform.appBundleSuffix) &&
+                        prefix.hasPrefix($0.path + "/")
+                }
             }
             .map(\.path)
             .sorted()
@@ -47,13 +65,21 @@ enum MetadataInspector {
             issues.append(.init(
                 severity: .warning,
                 category: "Package structure",
-                message: "IPALens could not find a top-level app bundle at Payload/*.app/Info.plist. You can still browse the package files."
+                message: platform.platformIdentifier == "ios"
+                    ? "IPALens could not find a top-level app bundle at Payload/*.app/Info.plist. You can still browse the package files."
+                    : "IPALens could not find a top-level macOS app bundle. You can still browse the package files."
             ))
         }
 
         for infoPath in infoPlistPaths {
             do {
-                let bundlePath = ArchivePathValidator.parentPath(of: infoPath)!
+                let bundlePath: String
+                if platform.platformIdentifier == "ios" {
+                    bundlePath = ArchivePathValidator.parentPath(of: infoPath)!
+                } else {
+                    let suffix = "/" + platform.infoPlistRelativePath
+                    bundlePath = String(infoPath.dropLast(suffix.count))
+                }
                 guard index.entryByPath[infoPath]?.uncompressedSize ?? 0 <= 32 * 1_024 * 1_024 else {
                     throw MetadataError.infoPlistTooLarge
                 }
@@ -61,7 +87,10 @@ enum MetadataInspector {
                 let plist = try PropertyListParser.dictionary(data: data)
 
                 let executableName = plist["CFBundleExecutable"] as? String
-                let executablePath = executableName.map { bundlePath + "/" + $0 }
+                let executablePath = executableName.map {
+                    let directory = platform.executableDirectory.isEmpty ? "" : "/" + platform.executableDirectory
+                    return bundlePath + directory + "/" + $0
+                }
                 let machO = executablePath.flatMap { path -> MachOSummary? in
                     guard index.entryByPath[path]?.uncompressedSize ?? 0 <= 512 * 1_024 * 1_024 else {
                         issues.append(.init(
@@ -95,14 +124,24 @@ enum MetadataInspector {
 
                 let urlSchemes = extractURLSchemes(from: plist)
                 let ats = extractATS(from: plist)
-                let frameworks = detectFrameworks(bundlePath: bundlePath, index: index)
-                let extensions = inspectExtensions(url: url, bundlePath: bundlePath, index: index, issues: &issues)
+                let frameworks = detectFrameworks(bundlePath: bundlePath, index: index, platform: platform)
+                let extensions = inspectExtensions(
+                    url: url,
+                    bundlePath: bundlePath,
+                    index: index,
+                    platform: platform,
+                    issues: &issues
+                )
                 let privacyPaths = index.entries
-                    .filter { $0.kind == .file && $0.path.hasPrefix(bundlePath + "/") && $0.name == "PrivacyInfo.xcprivacy" }
+                    .filter {
+                        $0.kind == .file &&
+                            $0.path.hasPrefix(bundlePath + "/") &&
+                            platform.privacyManifestNames.contains($0.name)
+                    }
                     .map(\.path)
                     .sorted()
 
-                if let profilePath = index.entries.first(where: {
+                if platform.platformIdentifier == "ios", let profilePath = index.entries.first(where: {
                     $0.kind == .file && $0.path == bundlePath + "/embedded.mobileprovision"
                 })?.path {
                     do {
@@ -127,10 +166,10 @@ enum MetadataInspector {
                     bundleIdentifier: plist["CFBundleIdentifier"] as? String,
                     version: plist["CFBundleShortVersionString"] as? String,
                     build: plist["CFBundleVersion"] as? String,
-                    minimumOSVersion: plist["MinimumOSVersion"] as? String,
+                    minimumOSVersion: plist[platform.minimumSystemVersionKey] as? String,
                     executableName: executableName,
                     executablePath: executablePath,
-                    iconPath: findIconPath(bundlePath: bundlePath, plist: plist, index: index),
+                    iconPath: findIconPath(bundlePath: bundlePath, plist: plist, index: index, platform: platform),
                     infoPlistPath: infoPath,
                     permissions: permissions,
                     urlSchemes: urlSchemes,
@@ -157,18 +196,25 @@ enum MetadataInspector {
         )
     }
 
-    private static func detectFrameworks(bundlePath: String, index: ArchiveIndex) -> [FrameworkSummary] {
+    private static func detectFrameworks(
+        bundlePath: String,
+        index: ArchiveIndex,
+        platform: PlatformDefinitionV1
+    ) -> [FrameworkSummary] {
         var values: [FrameworkSummary] = []
         let prefix = bundlePath + "/"
         for entry in index.entries where entry.path.hasPrefix(prefix) {
-            if entry.kind == .directory && entry.name.hasSuffix(".framework") {
+            let isFrameworkLocation = platform.frameworksDirectories.contains { directory in
+                entry.path.hasPrefix(bundlePath + "/" + directory + "/")
+            }
+            if entry.kind == .directory && entry.name.hasSuffix(".framework") && isFrameworkLocation {
                 values.append(.init(
                     path: entry.path,
                     name: entry.name,
                     kind: "Framework",
                     isInjectedCodeCandidate: false
                 ))
-            } else if entry.kind == .file && entry.name.lowercased().hasSuffix(".dylib") {
+            } else if entry.kind == .file && entry.name.lowercased().hasSuffix(".dylib") && isFrameworkLocation {
                 values.append(.init(
                     path: entry.path,
                     name: entry.name,
@@ -184,15 +230,24 @@ enum MetadataInspector {
         url: URL,
         bundlePath: String,
         index: ArchiveIndex,
+        platform: PlatformDefinitionV1,
         issues: inout [InspectionIssue]
     ) -> [ExtensionSummary] {
-        let extensionDirectories = index.entries.filter {
-            $0.kind == .directory &&
-                $0.path.hasPrefix(bundlePath + "/PlugIns/") &&
-                $0.name.hasSuffix(".appex")
+        let extensionDirectories = index.entries.filter { entry in
+            guard entry.kind == .directory,
+                  entry.path.hasPrefix(bundlePath + "/"),
+                  entry.path != bundlePath else { return false }
+            return platform.componentSuffixes.contains { suffix in
+                entry.path.lowercased().hasSuffix(suffix.lowercased())
+            }
         }
         return extensionDirectories.map { entry in
-            let plistPath = entry.path + "/Info.plist"
+            let plistPath: String
+            if platform.platformIdentifier == "macos" {
+                plistPath = entry.path + "/Contents/Info.plist"
+            } else {
+                plistPath = entry.path + "/Info.plist"
+            }
             do {
                 let data = try ArchiveIndexer.readEntry(url: url, index: index, path: plistPath).data
                 let plist = try PropertyListParser.dictionary(data: data)
@@ -236,8 +291,16 @@ enum MetadataInspector {
         )
     }
 
-    private static func findIconPath(bundlePath: String, plist: [String: Any], index: ArchiveIndex) -> String? {
+    private static func findIconPath(
+        bundlePath: String,
+        plist: [String: Any],
+        index: ArchiveIndex,
+        platform: PlatformDefinitionV1
+    ) -> String? {
         var iconNames: [String] = []
+        if let icon = plist["CFBundleIconFile"] as? String {
+            iconNames.append(icon)
+        }
         if let icons = plist["CFBundleIcons"] as? [String: Any],
            let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
            let files = primary["CFBundleIconFiles"] as? [String] {
@@ -249,16 +312,22 @@ enum MetadataInspector {
 
         let allPaths = Set(index.entries.filter { $0.kind == .file }.map(\.path))
         for name in iconNames {
-            let candidates = [name, name + ".png", name + "@3x.png", name + "@2x.png"]
+            let candidates: [String]
+            if platform.platformIdentifier == "macos" {
+                candidates = [name, name + ".icns"].map { bundlePath + "/Contents/Resources/" + $0 }
+            } else {
+                candidates = [name, name + ".png", name + "@3x.png", name + "@2x.png"].map { bundlePath + "/" + $0 }
+            }
             for candidate in candidates {
-                let path = bundlePath + "/" + candidate
-                if allPaths.contains(path) { return path }
+                if allPaths.contains(candidate) { return candidate }
             }
         }
 
         return index.entries.first(where: {
-            $0.kind == .file && $0.parentPath == bundlePath &&
-                ($0.name.localizedCaseInsensitiveContains("AppIcon") || $0.name == "iTunesArtwork")
+            $0.kind == .file && $0.path.hasPrefix(bundlePath + "/") &&
+                ($0.name.localizedCaseInsensitiveContains("AppIcon") ||
+                    $0.name == "iTunesArtwork" ||
+                    $0.name.lowercased().hasSuffix(".icns"))
         })?.path
     }
 

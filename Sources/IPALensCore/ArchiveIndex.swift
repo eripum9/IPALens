@@ -47,21 +47,31 @@ public enum ArchivePathValidator {
 }
 
 struct ArchiveIndex: Sendable {
-    let entries: [IPAEntry]
+    let entries: [PackageEntry]
     let archivePaths: [String: String]
+    let archiveURL: URL?
+    let physicalPaths: [String: URL]
     let totalUncompressedSize: Int64
-    let entryByPath: [String: IPAEntry]
+    let entryByPath: [String: PackageEntry]
 
-    init(entries: [IPAEntry], archivePaths: [String: String], totalUncompressedSize: Int64) {
+    init(
+        entries: [PackageEntry],
+        archivePaths: [String: String] = [:],
+        archiveURL: URL? = nil,
+        physicalPaths: [String: URL] = [:],
+        totalUncompressedSize: Int64
+    ) {
         self.entries = entries
         self.archivePaths = archivePaths
+        self.archiveURL = archiveURL
+        self.physicalPaths = physicalPaths
         self.totalUncompressedSize = totalUncompressedSize
         entryByPath = Dictionary(uniqueKeysWithValues: entries.map { ($0.path, $0) })
     }
 
     func replacingHashes(_ hashes: [String: String]) -> ArchiveIndex {
         let updated = entries.map { entry in
-            IPAEntry(
+            PackageEntry(
                 path: entry.path,
                 name: entry.name,
                 parentPath: entry.parentPath,
@@ -77,6 +87,8 @@ struct ArchiveIndex: Sendable {
         return ArchiveIndex(
             entries: updated,
             archivePaths: archivePaths,
+            archiveURL: archiveURL,
+            physicalPaths: physicalPaths,
             totalUncompressedSize: totalUncompressedSize
         )
     }
@@ -178,7 +190,7 @@ enum ArchiveIndexer {
         }
 
         let entries = records.values.map { record in
-            IPAEntry(
+            PackageEntry(
                 path: record.path,
                 name: record.path.split(separator: "/").last.map(String.init) ?? record.path,
                 parentPath: ArchivePathValidator.parentPath(of: record.path),
@@ -195,6 +207,7 @@ enum ArchiveIndexer {
         return ArchiveIndex(
             entries: entries,
             archivePaths: archivePaths,
+            archiveURL: url,
             totalUncompressedSize: totalUncompressedSize
         )
     }
@@ -204,24 +217,26 @@ enum ArchiveIndexer {
         index: ArchiveIndex,
         progress: (@Sendable (InspectionProgress) -> Void)?
     ) throws -> ArchiveIndex {
-        let archive = try Archive(url: url, accessMode: .read)
+        let archive = try index.archiveURL.map { try Archive(url: $0, accessMode: .read) }
 
         let files = index.entries.filter { $0.kind == .file }
         let progressStride = max(1, files.count / 500)
         var hashes: [String: String] = [:]
         for (offset, entry) in files.enumerated() {
             try Task.checkCancellation()
-            guard let archivePath = index.archivePaths[entry.path],
-                  let archiveEntry = archive[archivePath] else {
-                continue
-            }
-            var hasher = SHA256()
             do {
-                _ = try archive.extract(archiveEntry, bufferSize: 64 * 1_024) { chunk in
-                    try Task.checkCancellation()
-                    hasher.update(data: chunk)
+                if let archive,
+                   let archivePath = index.archivePaths[entry.path],
+                   let archiveEntry = archive[archivePath] {
+                    var hasher = SHA256()
+                    _ = try archive.extract(archiveEntry, bufferSize: 64 * 1_024) { chunk in
+                        try Task.checkCancellation()
+                        hasher.update(data: chunk)
+                    }
+                    hashes[entry.path] = hasher.finalize().hexString
+                } else if let physicalURL = index.physicalPaths[entry.path] {
+                    hashes[entry.path] = try SHA256.hash(fileAt: physicalURL)
                 }
-                hashes[entry.path] = hasher.finalize().hexString
             } catch {
                 // A corrupt individual entry is reported by the inspection layer.
             }
@@ -243,10 +258,34 @@ enum ArchiveIndexer {
         path: String,
         maximumBytes: Int64? = nil
     ) throws -> (data: Data, truncated: Bool) {
+        if let physicalURL = index.physicalPaths[path] {
+            guard index.entryByPath[path]?.kind == .file else {
+                throw IPAInspectionError.entryNotFound(path)
+            }
+            let handle = try FileHandle(forReadingFrom: physicalURL)
+            defer { try? handle.close() }
+            let limit = maximumBytes.map { max(0, $0) }
+            var data = Data()
+            var truncated = false
+            while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+                try Task.checkCancellation()
+                if let limit {
+                    let remaining = max(0, Int(limit) - data.count)
+                    if remaining > 0 { data.append(chunk.prefix(remaining)) }
+                    if chunk.count > remaining || Int64(data.count) >= limit && index.entryByPath[path]!.uncompressedSize > limit {
+                        truncated = true
+                        break
+                    }
+                } else {
+                    data.append(chunk)
+                }
+            }
+            return (data, truncated)
+        }
         guard let archivePath = index.archivePaths[path] else {
             throw IPAInspectionError.entryNotFound(path)
         }
-        let archive = try Archive(url: url, accessMode: .read)
+        let archive = try Archive(url: index.archiveURL ?? url, accessMode: .read)
         guard let entry = archive[archivePath] else { throw IPAInspectionError.entryNotFound(path) }
         guard entry.type == .file else {
             throw IPAInspectionError.entryNotFound(path)
@@ -283,8 +322,7 @@ enum ArchiveIndexer {
         path: String,
         destinationURL: URL
     ) throws -> String {
-        guard let archivePath = index.archivePaths[path],
-              let indexedEntry = index.entryByPath[path],
+        guard let indexedEntry = index.entryByPath[path],
               indexedEntry.kind == .file else {
             throw IPAInspectionError.entryNotFound(path)
         }
@@ -295,11 +333,6 @@ enum ArchiveIndexer {
         let required = indexedEntry.uncompressedSize + ArchiveSafetyLimits.minimumFreeSpaceReserve
         guard available >= required else {
             throw IPAInspectionError.insufficientDiskSpace(required: required, available: available)
-        }
-
-        let archive = try Archive(url: url, accessMode: .read)
-        guard let archiveEntry = archive[archivePath], archiveEntry.type == .file else {
-            throw IPAInspectionError.entryNotFound(path)
         }
 
         let fileManager = FileManager.default
@@ -317,10 +350,27 @@ enum ArchiveIndexer {
         let handle = try FileHandle(forWritingTo: destinationURL)
         var hasher = SHA256()
         do {
-            _ = try archive.extract(archiveEntry, bufferSize: 64 * 1_024) { chunk in
-                try Task.checkCancellation()
-                try handle.write(contentsOf: chunk)
-                hasher.update(data: chunk)
+            if let physicalURL = index.physicalPaths[path] {
+                let source = try FileHandle(forReadingFrom: physicalURL)
+                defer { try? source.close() }
+                while let chunk = try source.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+                    try Task.checkCancellation()
+                    try handle.write(contentsOf: chunk)
+                    hasher.update(data: chunk)
+                }
+            } else {
+                guard let archivePath = index.archivePaths[path] else {
+                    throw IPAInspectionError.entryNotFound(path)
+                }
+                let archive = try Archive(url: index.archiveURL ?? url, accessMode: .read)
+                guard let archiveEntry = archive[archivePath], archiveEntry.type == .file else {
+                    throw IPAInspectionError.entryNotFound(path)
+                }
+                _ = try archive.extract(archiveEntry, bufferSize: 64 * 1_024) { chunk in
+                    try Task.checkCancellation()
+                    try handle.write(contentsOf: chunk)
+                    hasher.update(data: chunk)
+                }
             }
             try handle.close()
         } catch is CancellationError {
@@ -348,11 +398,7 @@ enum ArchiveIndexer {
         destinationURL: URL,
         expectedSHA256: String?
     ) throws -> String {
-        guard let archivePath = index.archivePaths[path] else {
-            throw IPAInspectionError.entryNotFound(path)
-        }
-        let archive = try Archive(url: url, accessMode: .read)
-        guard let entry = archive[archivePath], entry.type == .file else {
+        guard index.entryByPath[path]?.kind == .file else {
             throw IPAInspectionError.entryNotFound(path)
         }
 
@@ -360,11 +406,7 @@ enum ArchiveIndexer {
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
         }
-        do {
-            _ = try archive.extract(entry, to: destinationURL)
-        } catch {
-            throw IPAInspectionError.extractionFailed(error.localizedDescription)
-        }
+        _ = try materializeEntry(url: url, index: index, path: path, destinationURL: destinationURL)
 
         let actualHash = try SHA256.hash(fileAt: destinationURL)
         if let expectedSHA256, expectedSHA256 != actualHash {
@@ -380,6 +422,104 @@ enum ArchiveIndexer {
             throw IPAInspectionError.sizeLimitExceeded(.max)
         }
         return result
+    }
+}
+
+enum DirectoryIndexer {
+    private struct Record {
+        let path: String
+        let kind: IPAEntryKind
+        let size: Int64
+        let physicalURL: URL
+    }
+
+    static func build(roots: [(logicalName: String, url: URL)]) throws -> ArchiveIndex {
+        var records: [String: Record] = [:]
+        var collisions = Set<String>()
+        var totalSize: Int64 = 0
+        var entryCount = 0
+
+        func visit(url: URL, logicalPath rawPath: String) throws {
+            try Task.checkCancellation()
+            let path = try ArchivePathValidator.normalize(rawPath)
+            let collision = ArchivePathValidator.collisionKey(for: path)
+            guard collisions.insert(collision).inserted else {
+                throw IPAInspectionError.duplicatePath(path)
+            }
+            entryCount += 1
+            guard entryCount <= ArchiveSafetyLimits.maximumEntryCount else {
+                throw IPAInspectionError.entryLimitExceeded(entryCount)
+            }
+
+            let values = try url.resourceValues(forKeys: [
+                .isSymbolicLinkKey,
+                .isDirectoryKey,
+                .isRegularFileKey,
+                .fileSizeKey
+            ])
+            let kind: IPAEntryKind
+            let size: Int64
+            if values.isSymbolicLink == true {
+                kind = .symbolicLink
+                size = 0
+            } else if values.isDirectory == true {
+                kind = .directory
+                size = 0
+            } else if values.isRegularFile == true {
+                kind = .file
+                size = Int64(values.fileSize ?? 0)
+                let (next, overflow) = totalSize.addingReportingOverflow(size)
+                guard !overflow, next <= ArchiveSafetyLimits.maximumUncompressedSize else {
+                    throw IPAInspectionError.sizeLimitExceeded(overflow ? .max : next)
+                }
+                totalSize = next
+            } else {
+                kind = .file
+                size = Int64(values.fileSize ?? 0)
+            }
+            records[path] = Record(path: path, kind: kind, size: size, physicalURL: url)
+
+            if kind == .directory {
+                let children = try FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: [.isSymbolicLinkKey, .isDirectoryKey, .isRegularFileKey, .fileSizeKey],
+                    options: []
+                ).sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+                for child in children {
+                    try visit(url: child, logicalPath: path + "/" + child.lastPathComponent)
+                }
+            }
+        }
+
+        for root in roots {
+            try visit(url: root.url, logicalPath: root.logicalName)
+        }
+
+        var children: [String: [String]] = [:]
+        for path in records.keys {
+            if let parent = ArchivePathValidator.parentPath(of: path) {
+                children[parent, default: []].append(path)
+            }
+        }
+        let entries = records.values.map { record in
+            PackageEntry(
+                path: record.path,
+                name: record.path.split(separator: "/").last.map(String.init) ?? record.path,
+                parentPath: ArchivePathValidator.parentPath(of: record.path),
+                kind: record.kind,
+                compressedSize: record.size,
+                uncompressedSize: record.size,
+                compressionMethod: "none",
+                sha256: nil,
+                childPaths: (children[record.path] ?? []).sorted(),
+                isSyntheticDirectory: false
+            )
+        }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        return ArchiveIndex(
+            entries: entries,
+            physicalPaths: Dictionary(uniqueKeysWithValues: records.map { ($0.key, $0.value.physicalURL) }),
+            totalUncompressedSize: totalSize
+        )
     }
 }
 

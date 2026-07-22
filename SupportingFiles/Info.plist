@@ -20,6 +20,34 @@
             <key>LSItemContentTypes</key>
             <array><string>com.apple.itunes.ipa</string></array>
         </dict>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array><string>app</string></array>
+            <key>CFBundleTypeName</key>
+            <string>macOS Application Bundle</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.apple.application-bundle</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array><string>zip</string><string>dmg</string><string>pkg</string><string>mpkg</string></array>
+            <key>CFBundleTypeName</key>
+            <string>macOS App Distribution Container</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.zip-archive</string>
+                <string>com.apple.disk-image-udif</string>
+                <string>com.apple.installer-package-archive</string>
+            </array>
+        </dict>
     </array>
     <key>CFBundleExecutable</key>
     <string>IPALens</string>
