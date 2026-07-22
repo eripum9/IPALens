@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Resolve dependencies
+        run: swift package resolve
+      - name: Test
+        run: swift test
+      - name: Build Universal app
+        run: chmod +x scripts/build-app.sh && scripts/build-app.sh
+      - name: Verify architectures
+        run: test "$(lipo -archs dist/IPALens.app/Contents/MacOS/IPALens)" = "x86_64 arm64" || test "$(lipo -archs dist/IPALens.app/Contents/MacOS/IPALens)" = "arm64 x86_64"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPALens-development
+          path: dist/IPALens.app

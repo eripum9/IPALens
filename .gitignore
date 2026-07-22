@@ -1,0 +1,16 @@
+.DS_Store
+.build/
+.swiftpm/
+dist/
+DerivedData/
+*.xcarchive
+*.dmg
+*.ipa
+
+# Local design exploration and generated intermediates
+Design/
+SupportingFiles/AppIcon-alpha.png
+
+# Xcode user state
+*.xcodeproj/xcuserdata/
+xcuserdata/
