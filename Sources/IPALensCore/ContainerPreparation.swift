@@ -26,14 +26,29 @@ enum ContainerPreparer {
             if let data = try? Data(contentsOf: stateURL),
                let state = try? JSONDecoder().decode(ContainerSessionState.self, from: data) {
                 guard state.processIdentifier != getpid(), !isProcessRunning(state.processIdentifier) else { continue }
-                for device in state.mountedDevices.reversed() {
-                    detach(device: device)
-                }
+                detach(devices: state.mountedDevices)
                 try? fileManager.removeItem(at: sessionURL)
             } else if let modified = try? sessionURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
                       modified < Date().addingTimeInterval(-24 * 60 * 60) {
                 try? fileManager.removeItem(at: sessionURL)
             }
+        }
+    }
+
+    static func cleanupCurrentProcessSessions() {
+        let fileManager = FileManager.default
+        guard let sessions = try? fileManager.contentsOfDirectory(
+            at: containersRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for sessionURL in sessions {
+            let stateURL = sessionURL.appendingPathComponent("Session.json")
+            guard let data = try? Data(contentsOf: stateURL),
+                  let state = try? JSONDecoder().decode(ContainerSessionState.self, from: data),
+                  state.processIdentifier == getpid() else { continue }
+            detach(devices: state.mountedDevices)
+            try? fileManager.removeItem(at: sessionURL)
         }
     }
 
@@ -89,9 +104,7 @@ enum ContainerPreparer {
     }
 
     static func cleanup(_ source: PreparedPackageSource) {
-        for device in source.mountedDevices.reversed() {
-            detach(device: device)
-        }
+        detach(devices: source.mountedDevices)
         if let temporaryRoot = source.temporaryRoot {
             try? FileManager.default.removeItem(at: temporaryRoot)
         }
@@ -102,9 +115,45 @@ enum ContainerPreparer {
         plugin: PluginManifestV1,
         reference: PluginReference
     ) throws -> PreparedPackageSource {
+        let temporaryRoot = try makeTemporaryRoot(prefix: "DMG")
+        let mountRoot = temporaryRoot.appendingPathComponent("Mounts", isDirectory: true)
+        try FileManager.default.createDirectory(at: mountRoot, withIntermediateDirectories: true)
+        var attachedDevices: [String] = []
+        do {
+            let response = try DiskImageServiceClient.embeddedServiceIsAvailable
+                ? DiskImageServiceClient.attach(imageURL: url, mountRoot: mountRoot)
+                : attachDiskImageLocally(imageURL: url, mountRoot: mountRoot)
+            attachedDevices = response.devices
+            try updateSession(at: temporaryRoot, mountedDevices: response.devices)
+            let roots = response.mountPaths.enumerated().map { offset, path in
+                let volumeURL = URL(fileURLWithPath: path, isDirectory: true)
+                let baseName = volumeURL.lastPathComponent.isEmpty ? "Volume" : volumeURL.lastPathComponent
+                let logicalName = response.mountPaths.count == 1 ? baseName : "\(baseName)-\(offset + 1)"
+                return (logicalName, volumeURL)
+            }
+            return PreparedPackageSource(
+                index: try DirectoryIndexer.build(roots: roots),
+                sourceKind: .diskImage,
+                platform: .macOS,
+                definition: plugin.platform,
+                plugin: reference,
+                temporaryRoot: temporaryRoot,
+                mountedDevices: response.devices
+            )
+        } catch {
+            detach(devices: attachedDevices)
+            try? FileManager.default.removeItem(at: temporaryRoot)
+            throw error
+        }
+    }
+
+    private static func attachDiskImageLocally(
+        imageURL: URL,
+        mountRoot: URL
+    ) throws -> DiskImageMountResponse {
         let encryptionResult = try run(
             executable: URL(fileURLWithPath: "/usr/bin/hdiutil"),
-            arguments: ["isencrypted", "-plist", url.path],
+            arguments: ["isencrypted", "-plist", imageURL.path],
             timeout: 20
         )
         if encryptionResult.status == 0,
@@ -114,17 +163,13 @@ enum ContainerPreparer {
             throw IPAInspectionError.encryptedDiskImageUnsupported
         }
 
-        let temporaryRoot = try makeTemporaryRoot(prefix: "DMG")
-        let mountRoot = temporaryRoot.appendingPathComponent("Mounts", isDirectory: true)
-        try FileManager.default.createDirectory(at: mountRoot, withIntermediateDirectories: true)
-        var attachedDevices: [String] = []
-        let devicesBeforeAttach = mountedDevices(forImageAt: url)
+        let devicesBeforeAttach = mountedDevices(forImageAt: imageURL)
         do {
             let result = try run(
                 executable: URL(fileURLWithPath: "/usr/bin/hdiutil"),
                 arguments: [
                     "attach", "-readonly", "-nobrowse", "-noautoopen", "-noautofsck",
-                    "-verify", "-plist", "-mountroot", mountRoot.path, url.path
+                    "-verify", "-plist", "-mountroot", mountRoot.path, imageURL.path
                 ],
                 timeout: 120
             )
@@ -137,36 +182,15 @@ enum ContainerPreparer {
                 throw IPAInspectionError.containerToolFailed("hdiutil", "The mount response was not valid property-list data.")
             }
             let devices = entities.compactMap { $0["dev-entry"] as? String }
-            attachedDevices = devices
-            try updateSession(at: temporaryRoot, mountedDevices: devices)
             let mountPaths = entities.compactMap { $0["mount-point"] as? String }
             guard !mountPaths.isEmpty else {
-                for device in devices.reversed() {
-                    detach(device: device)
-                }
+                detachLocally(devices: devices)
                 throw IPAInspectionError.containerToolFailed("hdiutil", "The disk image did not expose a mountable volume.")
             }
-            let roots = mountPaths.enumerated().map { offset, path in
-                let volumeURL = URL(fileURLWithPath: path, isDirectory: true)
-                let baseName = volumeURL.lastPathComponent.isEmpty ? "Volume" : volumeURL.lastPathComponent
-                let logicalName = mountPaths.count == 1 ? baseName : "\(baseName)-\(offset + 1)"
-                return (logicalName, volumeURL)
-            }
-            return PreparedPackageSource(
-                index: try DirectoryIndexer.build(roots: roots),
-                sourceKind: .diskImage,
-                platform: .macOS,
-                definition: plugin.platform,
-                plugin: reference,
-                temporaryRoot: temporaryRoot,
-                mountedDevices: devices
-            )
+            return .init(mountPaths: mountPaths, devices: devices)
         } catch {
-            let newlyMounted = mountedDevices(forImageAt: url).subtracting(devicesBeforeAttach)
-            for device in Set(attachedDevices).union(newlyMounted).sorted().reversed() {
-                detach(device: device)
-            }
-            try? FileManager.default.removeItem(at: temporaryRoot)
+            let newlyMounted = mountedDevices(forImageAt: imageURL).subtracting(devicesBeforeAttach)
+            detachLocally(devices: Array(newlyMounted))
             throw error
         }
     }
@@ -264,13 +288,24 @@ enum ContainerPreparer {
         return []
     }
 
-    private static func detach(device: String) {
-        _ = try? run(
-            executable: URL(fileURLWithPath: "/usr/bin/hdiutil"),
-            arguments: ["detach", device],
-            timeout: 20,
-            observesCancellation: false
-        )
+    private static func detach(devices: [String]) {
+        guard !devices.isEmpty else { return }
+        if DiskImageServiceClient.embeddedServiceIsAvailable {
+            DiskImageServiceClient.detach(devices: devices)
+        } else {
+            detachLocally(devices: devices)
+        }
+    }
+
+    private static func detachLocally(devices: [String]) {
+        for device in devices.reversed() {
+            _ = try? run(
+                executable: URL(fileURLWithPath: "/usr/bin/hdiutil"),
+                arguments: ["detach", device],
+                timeout: 20,
+                observesCancellation: false
+            )
+        }
     }
 
     private static func auditExpandingDirectory(_ root: URL) throws {

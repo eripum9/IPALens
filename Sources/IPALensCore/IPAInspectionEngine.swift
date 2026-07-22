@@ -32,6 +32,10 @@ public actor PackageInspectionEngine {
             .appendingPathComponent("Media-\(UUID().uuidString)", isDirectory: true)
     }
 
+    public static func cleanupContainerSessionsForApplicationTermination() {
+        ContainerPreparer.cleanupCurrentProcessSessions()
+    }
+
     deinit {
         for prepared in preparedSources.values {
             ContainerPreparer.cleanup(prepared)

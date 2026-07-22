@@ -67,10 +67,13 @@ The app will be written to `dist/IPALens.app`. To install the local build:
 ditto dist/IPALens.app /Applications/IPALens.app
 ```
 
+IPALens does not require a paid Apple Developer Program membership. Project builds are ad-hoc signed. A downloaded build may require the user to approve its first launch in System Settings → Privacy & Security because it is not notarized by Apple.
+
 ## Architecture
 
 - `IPALensCore` contains archive validation, inspection, previews, search, reports, and reusable data models.
 - `IPALensPluginKit` contains signed catalog verification, plugin-package validation, trust management, and isolated installation.
+- `IPALensContainerService` is a bundled, narrowly scoped XPC helper used only to mount and detach disk images. The host remains sandboxed; the helper never executes inspected content.
 - `IPALens` is the native SwiftUI macOS interface.
 - ZIP handling uses [ZIPFoundation 0.9.20](https://github.com/weichsel/ZIPFoundation).
 

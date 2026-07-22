@@ -8,9 +8,11 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
+        .library(name: "IPALensContainerBridge", targets: ["IPALensContainerBridge"]),
         .library(name: "IPALensPluginKit", targets: ["IPALensPluginKit"]),
         .library(name: "IPALensCore", targets: ["IPALensCore"]),
-        .executable(name: "IPALens", targets: ["IPALens"])
+        .executable(name: "IPALens", targets: ["IPALens"]),
+        .executable(name: "IPALensContainerService", targets: ["IPALensContainerService"])
     ],
     dependencies: [
         .package(
@@ -19,6 +21,7 @@ let package = Package(
         )
     ],
     targets: [
+        .target(name: "IPALensContainerBridge"),
         .target(
             name: "IPALensPluginKit",
             dependencies: [
@@ -28,6 +31,7 @@ let package = Package(
         .target(
             name: "IPALensCore",
             dependencies: [
+                "IPALensContainerBridge",
                 "IPALensPluginKit",
                 .product(name: "ZIPFoundation", package: "ZIPFoundation")
             ]
@@ -36,6 +40,10 @@ let package = Package(
             name: "IPALens",
             dependencies: ["IPALensCore", "IPALensPluginKit"],
             path: "Sources/IPALensApp"
+        ),
+        .executableTarget(
+            name: "IPALensContainerService",
+            dependencies: ["IPALensContainerBridge"]
         ),
         .testTarget(
             name: "IPALensCoreTests",

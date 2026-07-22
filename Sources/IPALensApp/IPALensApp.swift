@@ -1,9 +1,28 @@
+import AppKit
 import IPALensCore
 import IPALensPluginKit
 import SwiftUI
 
+private final class IPALensApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var isPreparingToTerminate = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isPreparingToTerminate else { return .terminateLater }
+        isPreparingToTerminate = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            PackageInspectionEngine.cleanupContainerSessionsForApplicationTermination()
+            DispatchQueue.main.async {
+                NSApplication.shared.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct IPALensApplication: App {
+    @NSApplicationDelegateAdaptor(IPALensApplicationDelegate.self) private var applicationDelegate
+
     init() {
         TemporaryDirectoryManager.removeStaleDirectories()
     }

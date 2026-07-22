@@ -291,6 +291,18 @@ final class WorkspaceModel: ObservableObject {
         progress = nil
     }
 
+    func closeWorkspace() {
+        loadTask?.cancel()
+        previewTask?.cancel()
+        searchTask?.cancel()
+        pluginInstallTask?.cancel()
+        if let sourceURL {
+            let inspectionEngine = engine
+            Task { await inspectionEngine.forget(url: sourceURL) }
+        }
+        releaseSecurityScope()
+    }
+
     func exportReport() {
         guard let snapshot else { return }
         let panel = NSSavePanel()

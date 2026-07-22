@@ -90,6 +90,7 @@ struct RootView: View {
             return true
         }, isTargeted: { model.isDropTargeted = $0 })
         .onOpenURL { model.open(url: $0) }
+        .onDisappear { model.closeWorkspace() }
         .focusedSceneValue(\.openIPAAction, WindowAction(perform: model.presentOpenPanel))
         .focusedSceneValue(
             \.exportReportAction,

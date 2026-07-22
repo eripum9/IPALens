@@ -18,7 +18,16 @@ jobs:
       - name: Build Universal app
         run: chmod +x scripts/build-app.sh && scripts/build-app.sh
       - name: Verify architectures
-        run: test "$(lipo -archs dist/IPALens.app/Contents/MacOS/IPALens)" = "x86_64 arm64" || test "$(lipo -archs dist/IPALens.app/Contents/MacOS/IPALens)" = "arm64 x86_64"
+        run: |
+          app_archs="$(lipo -archs dist/IPALens.app/Contents/MacOS/IPALens)"
+          service_archs="$(lipo -archs dist/IPALens.app/Contents/XPCServices/IPALensContainerService.xpc/Contents/MacOS/IPALensContainerService)"
+          test "$app_archs" = "x86_64 arm64" || test "$app_archs" = "arm64 x86_64"
+          test "$service_archs" = "x86_64 arm64" || test "$service_archs" = "arm64 x86_64"
+      - name: Verify sandbox boundary
+        run: |
+          codesign --verify --deep --strict dist/IPALens.app
+          codesign -d --entitlements :- dist/IPALens.app 2>/dev/null | grep -q '<key>com.apple.security.app-sandbox</key>'
+          ! codesign -d --entitlements :- dist/IPALens.app/Contents/XPCServices/IPALensContainerService.xpc 2>/dev/null | grep -q '<key>com.apple.security.app-sandbox</key>'
       - uses: actions/upload-artifact@v4
         with:
           name: IPALens-development
