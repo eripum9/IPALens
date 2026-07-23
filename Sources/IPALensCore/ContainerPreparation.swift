@@ -68,7 +68,8 @@ enum ContainerPreparer {
 
         guard let plugin,
               plugin.id == PluginManager.macOSPluginID,
-              plugin.platform.platformIdentifier == PlatformIdentifier.macOS.rawValue else {
+              let definition = plugin.platform,
+              definition.platformIdentifier == PlatformIdentifier.macOS.rawValue else {
             throw IPAInspectionError.requiredPluginMissing(PluginManager.macOSPluginID)
         }
         let reference = PluginReference(id: plugin.id, version: plugin.version)
@@ -79,7 +80,7 @@ enum ContainerPreparer {
                 index: try ArchiveIndexer.build(url: url),
                 sourceKind: .zipArchive,
                 platform: .macOS,
-                definition: plugin.platform,
+                definition: definition,
                 plugin: reference,
                 temporaryRoot: nil,
                 mountedDevices: []
@@ -89,15 +90,15 @@ enum ContainerPreparer {
                 index: try DirectoryIndexer.build(roots: [(url.lastPathComponent, url)]),
                 sourceKind: .applicationBundle,
                 platform: .macOS,
-                definition: plugin.platform,
+                definition: definition,
                 plugin: reference,
                 temporaryRoot: nil,
                 mountedDevices: []
             )
         case "dmg":
-            return try prepareDiskImage(url: url, plugin: plugin, reference: reference)
+            return try prepareDiskImage(url: url, definition: definition, reference: reference)
         case "pkg", "mpkg":
-            return try prepareInstallerPackage(url: url, plugin: plugin, reference: reference)
+            return try prepareInstallerPackage(url: url, definition: definition, reference: reference)
         default:
             throw IPAInspectionError.unsupportedSourceType(fileExtension)
         }
@@ -112,7 +113,7 @@ enum ContainerPreparer {
 
     private static func prepareDiskImage(
         url: URL,
-        plugin: PluginManifestV1,
+        definition: PlatformDefinitionV1,
         reference: PluginReference
     ) throws -> PreparedPackageSource {
         let temporaryRoot = try makeTemporaryRoot(prefix: "DMG")
@@ -135,7 +136,7 @@ enum ContainerPreparer {
                 index: try DirectoryIndexer.build(roots: roots),
                 sourceKind: .diskImage,
                 platform: .macOS,
-                definition: plugin.platform,
+                definition: definition,
                 plugin: reference,
                 temporaryRoot: temporaryRoot,
                 mountedDevices: response.devices
@@ -197,7 +198,7 @@ enum ContainerPreparer {
 
     private static func prepareInstallerPackage(
         url: URL,
-        plugin: PluginManifestV1,
+        definition: PlatformDefinitionV1,
         reference: PluginReference
     ) throws -> PreparedPackageSource {
         let sourceSize = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
@@ -228,7 +229,7 @@ enum ContainerPreparer {
                 index: try DirectoryIndexer.build(roots: [(url.deletingPathExtension().lastPathComponent, expanded)]),
                 sourceKind: .installerPackage,
                 platform: .macOS,
-                definition: plugin.platform,
+                definition: definition,
                 plugin: reference,
                 temporaryRoot: temporaryRoot,
                 mountedDevices: []

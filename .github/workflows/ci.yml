@@ -28,7 +28,15 @@ jobs:
           codesign --verify --deep --strict dist/IPALens.app
           codesign -d --entitlements :- dist/IPALens.app 2>/dev/null | grep -q '<key>com.apple.security.app-sandbox</key>'
           ! codesign -d --entitlements :- dist/IPALens.app/Contents/XPCServices/IPALensContainerService.xpc 2>/dev/null | grep -q '<key>com.apple.security.app-sandbox</key>'
+      - name: Build architecture-specific installers
+        run: chmod +x scripts/build-installers.sh && scripts/build-installers.sh
+      - name: Verify installer payloads
+        run: |
+          pkgutil --payload-files dist/installers/IPALens-1.0.0-Apple-Silicon.pkg | grep -q '^\./IPALens.app/Contents/MacOS/IPALens$'
+          pkgutil --payload-files dist/installers/IPALens-1.0.0-Intel.pkg | grep -q '^\./IPALens.app/Contents/MacOS/IPALens$'
       - uses: actions/upload-artifact@v4
         with:
           name: IPALens-development
-          path: dist/IPALens.app
+          path: |
+            dist/IPALens.app
+            dist/installers/*.pkg

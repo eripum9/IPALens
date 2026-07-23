@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import IPALensContainerBridge
 
@@ -21,6 +22,8 @@ private final class DiskImageService: NSObject, IPALensDiskImageServiceProtocol,
     private let stateLock = NSLock()
     private var activeProcess: Process?
     private var isCancelled = false
+    private let pluginSessionsLock = NSLock()
+    private var pluginSessions: [String: PluginProcessSession] = [:]
 
     func attachDiskImage(
         atPath imagePath: String,
@@ -109,12 +112,122 @@ private final class DiskImageService: NSObject, IPALensDiskImageServiceProtocol,
         }
     }
 
+    func startVerifiedPluginComponent(
+        atPath executablePath: String,
+        expectedSHA256: String,
+        arguments: [String],
+        environment: [String: String],
+        withReply reply: @escaping @Sendable (String?, String?) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            do {
+                let executable = URL(fileURLWithPath: executablePath).standardizedFileURL
+                try verifySigningComponent(at: executable, expectedSHA256: expectedSHA256)
+                guard arguments.count <= 64,
+                      arguments.allSatisfy({ $0.utf8.count <= 16 * 1_024 }),
+                      Set(environment.keys).isSubset(of: ["IPALENS_APPLE_ID", "IPALENS_APPLE_PASSWORD"]) else {
+                    throw ServiceError.invalidPluginRequest
+                }
+                let identifier = UUID().uuidString
+                let session = try PluginProcessSession(
+                    executable: executable,
+                    arguments: arguments,
+                    additionalEnvironment: environment
+                )
+                pluginSessionsLock.lock()
+                pluginSessions[identifier] = session
+                pluginSessionsLock.unlock()
+                reply(identifier, nil)
+            } catch {
+                reply(nil, error.localizedDescription)
+            }
+        }
+    }
+
+    func pollPluginComponentSession(
+        _ sessionIdentifier: String,
+        afterOffset: Int,
+        withReply reply: @escaping @Sendable (Data?, Int, Bool, Int32, String?) -> Void
+    ) {
+        pluginSessionsLock.lock()
+        let session = pluginSessions[sessionIdentifier]
+        pluginSessionsLock.unlock()
+        guard let session else {
+            reply(nil, afterOffset, true, -1, "The extension session is no longer available.")
+            return
+        }
+        let snapshot = session.snapshot(afterOffset: afterOffset)
+        reply(snapshot.data, snapshot.nextOffset, snapshot.finished, snapshot.status, snapshot.error)
+        if snapshot.finished {
+            pluginSessionsLock.lock()
+            pluginSessions.removeValue(forKey: sessionIdentifier)
+            pluginSessionsLock.unlock()
+        }
+    }
+
+    func writePluginComponentSession(
+        _ sessionIdentifier: String,
+        input: Data,
+        withReply reply: @escaping @Sendable (String?) -> Void
+    ) {
+        pluginSessionsLock.lock()
+        let session = pluginSessions[sessionIdentifier]
+        pluginSessionsLock.unlock()
+        guard input.count <= 16 * 1_024, let session else {
+            reply("The extension session is unavailable or the response is too large.")
+            return
+        }
+        do {
+            try session.write(input)
+            reply(nil)
+        } catch {
+            reply(error.localizedDescription)
+        }
+    }
+
+    func cancelPluginComponentSession(
+        _ sessionIdentifier: String,
+        withReply reply: @escaping @Sendable () -> Void
+    ) {
+        pluginSessionsLock.lock()
+        let session = pluginSessions.removeValue(forKey: sessionIdentifier)
+        pluginSessionsLock.unlock()
+        session?.cancel()
+        reply()
+    }
+
     func cancelActiveOperation() {
         stateLock.lock()
         isCancelled = true
         let process = activeProcess
         stateLock.unlock()
         terminate(process)
+        pluginSessionsLock.lock()
+        let sessions = Array(pluginSessions.values)
+        pluginSessions.removeAll()
+        pluginSessionsLock.unlock()
+        sessions.forEach { $0.cancel() }
+    }
+
+    private func verifySigningComponent(at url: URL, expectedSHA256: String) throws {
+        let expectedSuffix = "/com.eripum9.ipalens.extension.signing/1.0.0/Components/IPALensSigningExtension"
+        guard url.path.hasSuffix(expectedSuffix),
+              url.path.contains("/Library/Application Support/IPALens/Plugins/"),
+              expectedSHA256.count == 64,
+              expectedSHA256.allSatisfy({ $0.isHexDigit }) else {
+            throw ServiceError.invalidPluginRequest
+        }
+        var information = stat()
+        guard lstat(url.path, &information) == 0,
+              (information.st_mode & S_IFMT) == S_IFREG,
+              information.st_uid == getuid(),
+              information.st_size > 0,
+              information.st_size <= 40 * 1_024 * 1_024 else {
+            throw ServiceError.invalidPluginRequest
+        }
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard actual == expectedSHA256.lowercased() else { throw ServiceError.pluginVerificationFailed }
     }
 
     private func resetCancellation() {
@@ -257,6 +370,114 @@ private final class DiskImageService: NSObject, IPALensDiskImageServiceProtocol,
     }
 }
 
+private final class PluginProcessSession: @unchecked Sendable {
+    struct Snapshot {
+        let data: Data
+        let nextOffset: Int
+        let finished: Bool
+        let status: Int32
+        let error: String?
+    }
+
+    private static let maximumOutputBytes = 16 * 1_024 * 1_024
+    private let lock = NSLock()
+    private let process = Process()
+    private let inputPipe = Pipe()
+    private let outputPipe = Pipe()
+    private var output = Data()
+    private var finished = false
+    private var terminationStatus: Int32 = 0
+    private var errorMessage: String?
+
+    init(executable: URL, arguments: [String], additionalEnvironment: [String: String]) throws {
+        process.executableURL = executable
+        process.arguments = arguments
+        var environment = ["PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "LC_ALL": "C", "TERM": "dumb"]
+        let inherited = ProcessInfo.processInfo.environment
+        for key in ["HOME", "USER", "LOGNAME", "TMPDIR", "SSH_AUTH_SOCK"] {
+            if let value = inherited[key] { environment[key] = value }
+        }
+        environment.merge(additionalEnvironment) { _, new in new }
+        process.environment = environment
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.append(data)
+        }
+        process.terminationHandler = { [weak self] process in
+            self?.markFinished(status: process.terminationStatus)
+        }
+        do {
+            try process.run()
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            throw error
+        }
+    }
+
+    func snapshot(afterOffset offset: Int) -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        let safeOffset = max(0, min(offset, output.count))
+        let data = output.subdata(in: safeOffset..<output.count)
+        return Snapshot(
+            data: data,
+            nextOffset: output.count,
+            finished: finished,
+            status: terminationStatus,
+            error: errorMessage
+        )
+    }
+
+    func write(_ data: Data) throws {
+        lock.lock()
+        let canWrite = !finished
+        lock.unlock()
+        guard canWrite else { throw ServiceError.pluginSessionFinished }
+        var line = data
+        if line.last != 0x0A { line.append(0x0A) }
+        try inputPipe.fileHandleForWriting.write(contentsOf: line)
+    }
+
+    func cancel() {
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        try? inputPipe.fileHandleForWriting.close()
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(2)
+        while process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+        process.waitUntilExit()
+    }
+
+    private func append(_ data: Data) {
+        var shouldCancel = false
+        lock.lock()
+        if output.count + data.count > Self.maximumOutputBytes {
+            errorMessage = "The extension produced more than 16 MiB of diagnostic output."
+            shouldCancel = true
+        } else {
+            output.append(data)
+        }
+        lock.unlock()
+        if shouldCancel { cancel() }
+    }
+
+    private func markFinished(status: Int32) {
+        let remaining = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        lock.lock()
+        if output.count + remaining.count <= Self.maximumOutputBytes { output.append(remaining) }
+        finished = true
+        terminationStatus = status
+        lock.unlock()
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        try? inputPipe.fileHandleForWriting.close()
+    }
+}
+
 private enum ServiceError: LocalizedError {
     case invalidRequest
     case invalidResponse
@@ -265,6 +486,9 @@ private enum ServiceError: LocalizedError {
     case excessiveOutput
     case captureUnavailable
     case toolFailed(String)
+    case invalidPluginRequest
+    case pluginVerificationFailed
+    case pluginSessionFinished
 
     var errorDescription: String? {
         switch self {
@@ -275,6 +499,9 @@ private enum ServiceError: LocalizedError {
         case .excessiveOutput: "hdiutil produced too much diagnostic output."
         case .captureUnavailable: "IPALens could not create bounded diagnostic output files."
         case .toolFailed(let detail): detail
+        case .invalidPluginRequest: "The executable extension request was invalid."
+        case .pluginVerificationFailed: "The executable extension no longer matches its signed component hash."
+        case .pluginSessionFinished: "The executable extension session has already finished."
         }
     }
 }

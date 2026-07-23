@@ -38,7 +38,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "IPALens",
-            dependencies: ["IPALensCore", "IPALensPluginKit"],
+            dependencies: ["IPALensCore", "IPALensPluginKit", "IPALensContainerBridge"],
             path: "Sources/IPALensApp"
         ),
         .executableTarget(

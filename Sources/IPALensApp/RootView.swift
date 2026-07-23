@@ -504,6 +504,18 @@ private struct SigningList: View {
     @ObservedObject var model: WorkspaceModel
     var body: some View {
         List {
+            Section("Signing extension") {
+                if model.snapshot?.platform != .iOS || model.snapshot?.sourceKind != .ipaArchive {
+                    Label("Available only for iOS IPA packages", systemImage: "iphone.slash")
+                        .foregroundStyle(.secondary)
+                } else if model.signingExtension.installation == nil {
+                    Label("Signing & Device Support — Available", systemImage: "arrow.down.circle")
+                } else {
+                    Label("Personal Team signing ready", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+            }
+            Section("Existing signature") {
             if let signing = model.selectedSigning {
                 Label(signing.status.rawValue.capitalized, systemImage: signing.status == .valid ? "checkmark.seal" : "exclamationmark.shield")
                 ForEach(signing.certificates) { certificate in
@@ -518,6 +530,7 @@ private struct SigningList: View {
                     symbol: "signature",
                     description: "IPALens could not read a code signature for the selected app bundle."
                 )
+            }
             }
         }
     }

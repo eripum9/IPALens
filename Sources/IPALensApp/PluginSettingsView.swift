@@ -38,6 +38,7 @@ private struct PluginStoreItem: Identifiable, Hashable {
     let available: AvailablePlugin?
     let installation: PluginInstallation?
     let isBuiltIn: Bool
+    let isInUse: Bool
 
     var pluginID: String {
         available?.entry.id ?? installation?.id ?? "com.eripum9.ipalens.platform.ios"
@@ -106,11 +107,20 @@ private struct PluginStoreItem: Identifiable, Hashable {
 
     var hasUpdate: Bool { actionState == .update }
 
+    var isPrivilegedExtension: Bool {
+        if installation?.manifest.resolvedKind == .privilegedExtension { return true }
+        let capabilities = available?.entry.capabilities ?? []
+        return capabilities.contains(.iOSPersonalTeamSigning)
+            || capabilities.contains(.usbDeviceManagement)
+            || capabilities.contains(.xcodeManagement)
+    }
+
     static let builtIn = PluginStoreItem(
         id: "built-in-ios",
         available: nil,
         installation: nil,
-        isBuiltIn: true
+        isBuiltIn: true,
+        isInUse: false
     )
 }
 
@@ -119,6 +129,7 @@ private final class PluginStoreModel: ObservableObject {
     @Published var installed: [PluginInstallation] = []
     @Published var available: [AvailablePlugin] = []
     @Published var sources: [PluginSource] = []
+    @Published var inUsePluginIDs: Set<String> = []
     @Published var items: [PluginStoreItem] = [.builtIn]
     @Published var destination: PluginStoreDestination? = .discover
     @Published var selectedItemID: String?
@@ -164,9 +175,11 @@ private final class PluginStoreModel: ObservableObject {
                 async let installedPlugins = manager.installedPlugins()
                 async let pluginSources = manager.sources()
                 async let catalogPlugins = manager.availablePlugins()
+                async let pluginsInUse = manager.pluginsInUse()
                 installed = try await installedPlugins
                 sources = try await pluginSources
                 available = try await catalogPlugins.map { AvailablePlugin(entry: $0.0, source: $0.1) }
+                inUsePluginIDs = await pluginsInUse
                 rebuildItems()
             } catch is CancellationError {
                 // Closing the store cancels catalog work without changing installed plugins.
@@ -282,7 +295,8 @@ private final class PluginStoreModel: ObservableObject {
                 id: plugin.id,
                 available: plugin,
                 installation: installed.first { $0.id == plugin.entry.id },
-                isBuiltIn: false
+                isBuiltIn: false,
+                isInUse: inUsePluginIDs.contains(plugin.entry.id)
             )
         })
         let advertisedIDs = Set(available.map { $0.entry.id })
@@ -291,7 +305,8 @@ private final class PluginStoreModel: ObservableObject {
                 id: "installed:\(installation.id)",
                 available: nil,
                 installation: installation,
-                isBuiltIn: false
+                isBuiltIn: false,
+                isInUse: inUsePluginIDs.contains(installation.id)
             )
         })
         items = rebuilt
@@ -360,6 +375,7 @@ private final class PluginStoreModel: ObservableObject {
 
     private func reloadInstalledPlugins() async throws {
         installed = try await manager.installedPlugins()
+        inUsePluginIDs = await manager.pluginsInUse()
         rebuildItems()
     }
 
@@ -470,9 +486,9 @@ struct PluginStoreView: View {
             .navigationTitle("Plugins")
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Label("Data-only plugins", systemImage: "checkmark.shield.fill")
+                    Label("Verified plugin packages", systemImage: "checkmark.shield.fill")
                         .font(.caption.weight(.semibold))
-                    Text("Plugins are inspected before activation and cannot contain executable code.")
+                    Text("Executable components are accepted only from the signed official catalog and are shown with their permissions.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -541,7 +557,7 @@ struct PluginStoreView: View {
                 title: model.destination == .updates ? "Updates" : "Discover",
                 subtitle: model.destination == .updates
                     ? "Keep your installed platform support current."
-                    : "Expand what IPALens can inspect with verified, data-only plugins.",
+                    : "Add inspection platforms and optional verified capabilities to IPALens.",
                 items: model.destination == .updates ? model.updateItems : model.items,
                 emptyMessage: model.destination == .updates ? "All plugins are up to date." : "No plugins are available.",
                 model: model
@@ -650,6 +666,7 @@ private struct FeaturedPluginCard: View {
             PluginActionControl(
                 state: item.actionState,
                 isBusy: isBusy,
+                isDisabled: item.isInUse && item.actionState == .uninstall,
                 progress: progress,
                 onAction: onAction,
                 onCancel: onCancel
@@ -704,6 +721,7 @@ private struct PluginCard: View {
             PluginActionControl(
                 state: item.actionState,
                 isBusy: isBusy,
+                isDisabled: item.isInUse && item.actionState == .uninstall,
                 progress: progress,
                 onAction: onAction,
                 onCancel: onCancel
@@ -771,6 +789,7 @@ private struct PluginDetailView: View {
                     PluginActionControl(
                         state: item.actionState,
                         isBusy: model.busyPluginID == item.pluginID,
+                        isDisabled: item.isInUse && item.actionState == .uninstall,
                         progress: model.operationProgress,
                         onAction: { model.performPrimaryAction(for: item) },
                         onCancel: model.cancelOperation
@@ -821,13 +840,22 @@ private struct PluginDetailView: View {
                         MarkdownReadmeView(markdown: model.details?.readme ?? PluginPackageDetails.missingReadmeText)
                     }
                 } else {
-                    PluginPermissionsView(permissions: permissions)
+                    PluginPermissionsView(
+                        permissions: permissions,
+                        isPrivilegedExtension: item.isPrivilegedExtension
+                    )
                 }
 
                 Divider().padding(.vertical, 28)
                 HStack {
-                    Label("Read-only, data-only plugin", systemImage: "checkmark.shield.fill")
+                    Label(
+                        item.isPrivilegedExtension ? "Verified executable extension" : "Read-only, data-only plugin",
+                        systemImage: item.isPrivilegedExtension ? "exclamationmark.shield.fill" : "checkmark.shield.fill"
+                    )
                     Spacer()
+                    if item.isInUse {
+                        Label("In use", systemImage: "lock.fill")
+                    }
                     Text(item.pluginID)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
@@ -846,6 +874,7 @@ private struct PluginDetailView: View {
 
 private struct PluginPermissionsView: View {
     let permissions: [PluginPermission]
+    let isPrivilegedExtension: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -883,7 +912,9 @@ private struct PluginPermissionsView: View {
             }
 
             Label(
-                "These are IPALens host capabilities, not macOS permission grants. Data-only plugins cannot run commands or access files on their own.",
+                isPrivilegedExtension
+                    ? "This official extension can run only its separately verified components during actions you start. IPALens rechecks each component before launch."
+                    : "These are IPALens host capabilities, not macOS permission grants. Data-only plugins cannot run commands or access files on their own.",
                 systemImage: "info.circle"
             )
             .font(.caption)
@@ -904,6 +935,11 @@ private struct PermissionIcon: View {
         case .installerPackages: .pink
         case .providerNetwork: .cyan
         case .systemCommand: .gray
+        case .executableCode: .red
+        case .keychain: .yellow
+        case .usbDevices: .mint
+        case .appleDeveloperAccount: .blue
+        case .xcodeInstallation: .indigo
         }
     }
 
@@ -1003,6 +1039,7 @@ private struct PluginSourcesView: View {
 private struct PluginActionControl: View {
     let state: PluginActionState
     let isBusy: Bool
+    let isDisabled: Bool
     let progress: Double?
     let onAction: () -> Void
     let onCancel: () -> Void
@@ -1054,10 +1091,13 @@ private struct PluginActionControl: View {
                 Button("UPDATE", action: onAction)
                     .font(.caption.bold())
                     .buttonStyle(StoreCapsuleButtonStyle(tint: .accentColor))
+                    .disabled(isDisabled)
             case .uninstall:
                 Button("UNINSTALL", action: onAction)
                     .font(.caption.bold())
                     .buttonStyle(StoreCapsuleButtonStyle(tint: .red))
+                    .disabled(isDisabled)
+                    .help(isDisabled ? "Close packages using this plugin before uninstalling." : "Uninstall Plugin")
             }
         }
     }

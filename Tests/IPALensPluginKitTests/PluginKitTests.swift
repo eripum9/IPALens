@@ -126,6 +126,122 @@ struct PluginKitTests {
         }
     }
 
+    @Test func rejectsExecutableComponentsFromLocalPackages() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IPALens-ExecutablePluginTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("Source", isDirectory: true)
+        let components = source.appendingPathComponent("Components", isDirectory: true)
+        try FileManager.default.createDirectory(at: components, withIntermediateDirectories: true)
+        let componentData = Data("not-an-executable".utf8)
+        try componentData.write(to: components.appendingPathComponent("TestComponent"))
+        let componentHash = SHA256.hash(data: componentData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let manifest: [String: Any] = [
+            "schemaVersion": 2,
+            "kind": "privilegedExtension",
+            "id": "com.example.ipalens.executable",
+            "name": "Executable Test",
+            "version": "1.0.0",
+            "publisher": "Untrusted Publisher",
+            "description": "Must not be accepted from a local source.",
+            "hostAPIVersion": 2,
+            "capabilities": ["usbDeviceManagement"],
+            "components": [[
+                "id": "test-component",
+                "role": "signingService",
+                "relativePath": "Components/TestComponent",
+                "sha256": componentHash,
+                "architectures": ["arm64", "x86_64"],
+                "minimumMacOS": "13.0",
+                "allowedCommands": ["/usr/bin/codesign"]
+            ]]
+        ]
+        try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            .write(to: source.appendingPathComponent("Plugin.json"))
+        let package = root.appendingPathComponent("Executable.ipalensplugin")
+        try FileManager.default.zipItem(at: source, to: package, shouldKeepParent: false)
+
+        let manager = PluginManager(storageRoot: root.appendingPathComponent("Installed", isDirectory: true))
+        await #expect(throws: PluginError.self) {
+            _ = try await manager.importLocalPackage(url: package, allowUnsigned: true)
+        }
+    }
+
+    @Test func verifiesAndInstallsOfficialExecutableComponents() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IPALens-OfficialExecutableTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sourceDirectory = root.appendingPathComponent("Source", isDirectory: true)
+        let componentDirectory = sourceDirectory.appendingPathComponent("Components", isDirectory: true)
+        try FileManager.default.createDirectory(at: componentDirectory, withIntermediateDirectories: true)
+        let componentData = Data("verified-component-fixture".utf8)
+        try componentData.write(to: componentDirectory.appendingPathComponent("Fixture"))
+        let componentHash = SHA256.hash(data: componentData).map { String(format: "%02x", $0) }.joined()
+        let manifest: [String: Any] = [
+            "schemaVersion": 2,
+            "kind": "privilegedExtension",
+            "id": "com.example.ipalens.official-executable",
+            "name": "Official Executable Test",
+            "version": "1.0.0",
+            "publisher": "Test Publisher",
+            "description": "Verified executable test package.",
+            "hostAPIVersion": 2,
+            "capabilities": ["iOSPersonalTeamSigning", "usbDeviceManagement"],
+            "components": [[
+                "id": "fixture",
+                "role": "signingService",
+                "relativePath": "Components/Fixture",
+                "sha256": componentHash,
+                "architectures": ["arm64", "x86_64"],
+                "minimumMacOS": "13.0",
+                "allowedCommands": ["/usr/bin/codesign", "/usr/bin/xcrun"]
+            ]]
+        ]
+        try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            .write(to: sourceDirectory.appendingPathComponent("Plugin.json"))
+        try Data("# Official Executable Test\n".utf8).write(to: sourceDirectory.appendingPathComponent("README.md"))
+        let packageURL = root.appendingPathComponent("Official.ipalensplugin")
+        try FileManager.default.zipItem(at: sourceDirectory, to: packageURL, shouldKeepParent: false)
+        let packageData = try Data(contentsOf: packageURL)
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let entry = PluginCatalogEntry(
+            id: "com.example.ipalens.official-executable",
+            name: "Official Executable Test",
+            version: "1.0.0",
+            publisher: "Test Publisher",
+            description: "Verified executable test package.",
+            hostAPIVersion: 2,
+            capabilities: [.iOSPersonalTeamSigning, .usbDeviceManagement],
+            downloadSize: Int64(packageData.count),
+            artifactURL: try #require(URL(string: "https://plugins.example.com/official.ipalensplugin")),
+            sha256: SHA256.hash(data: packageData).map { String(format: "%02x", $0) }.joined(),
+            signature: try privateKey.signature(for: packageData).base64EncodedString()
+        )
+        PluginFixtureURLProtocol.responseData = packageData
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PluginFixtureURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let manager = PluginManager(storageRoot: root.appendingPathComponent("Installed", isDirectory: true), session: session)
+        let pluginSource = PluginSource(
+            name: "Fixture Official Source",
+            catalogURL: try #require(URL(string: "https://plugins.example.com/catalog.json")),
+            trust: .official,
+            publicKey: privateKey.publicKey.rawRepresentation.base64EncodedString()
+        )
+
+        let details = try await manager.packageDetails(entry: entry, from: pluginSource)
+        #expect(details.manifest.resolvedKind == .privilegedExtension)
+        #expect(details.permissions.contains { $0.kind == .executableCode })
+        #expect(details.permissions.contains { $0.kind == .usbDevices })
+        let installation = try await manager.install(entry: entry, from: pluginSource)
+        let componentURL = installation.installationURL.appendingPathComponent("Components/Fixture")
+        #expect(try Data(contentsOf: componentURL) == componentData)
+        let attributes = try FileManager.default.attributesOfItem(atPath: componentURL.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o500)
+    }
+
     @Test func installsOfficialPluginInIsolatedStorageWhenRequested() async throws {
         guard ProcessInfo.processInfo.environment["IPALENS_TEST_OFFICIAL_CATALOG"] == "1" else { return }
         let root = FileManager.default.temporaryDirectory
@@ -145,6 +261,21 @@ struct PluginKitTests {
         #expect(try await manager.installedPlugin(id: PluginManager.macOSPluginID) != nil)
         try await manager.removePlugin(id: PluginManager.macOSPluginID)
         #expect(try await manager.installedPlugin(id: PluginManager.macOSPluginID) == nil)
+
+        let signingEntry = try #require(catalog.payload.plugins.first { $0.id == PluginManager.signingPluginID })
+        let details = try await manager.packageDetails(entry: signingEntry, from: source)
+        #expect(details.manifest.resolvedKind == .privilegedExtension)
+        #expect(details.permissions.contains { $0.kind == .xcodeInstallation })
+        let signingInstallation = try await manager.install(entry: signingEntry, from: source)
+        #expect(signingInstallation.trust == .official)
+        #expect(signingInstallation.manifest.resolvedComponents.count == 2)
+        for component in signingInstallation.manifest.resolvedComponents {
+            #expect(FileManager.default.isExecutableFile(
+                atPath: signingInstallation.installationURL.appendingPathComponent(component.relativePath).path
+            ))
+        }
+        try await manager.removePlugin(id: PluginManager.signingPluginID)
+        #expect(try await manager.installedPlugin(id: PluginManager.signingPluginID) == nil)
     }
 
     @Test func preventsRemovalWhileAPluginVersionIsInUse() async throws {
@@ -161,6 +292,11 @@ struct PluginKitTests {
         let installation = try await manager.importLocalPackage(url: package, allowUnsigned: true)
 
         await manager.beginUsing(pluginID: installation.id)
+        await manager.beginUsing(pluginID: installation.id)
+        await #expect(throws: PluginError.self) {
+            try await manager.removePlugin(id: installation.id)
+        }
+        await manager.endUsing(pluginID: installation.id)
         await #expect(throws: PluginError.self) {
             try await manager.removePlugin(id: installation.id)
         }
@@ -239,4 +375,25 @@ struct PluginKitTests {
             ]
         ]
     }
+}
+
+private final class PluginFixtureURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var responseData = Data()
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Length": String(Self.responseData.count)]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.responseData)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

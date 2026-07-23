@@ -1,6 +1,9 @@
 # Creating an IPALens Plugin
 
-IPALens plugins are signed, data-only platform definitions. They extend package recognition and inspection layouts without loading executable plugin code.
+IPALens supports two deliberately separate plugin tiers:
+
+- **Platform definitions** are data-only packages that extend recognition and inspection layouts. Official, third-party, and explicitly approved local sources may provide them.
+- **Privileged extensions** contain verified native components for narrowly scoped capabilities. IPALens accepts these only from its pinned official catalog; third-party and local executable packages are rejected even when the user approves an unsigned import.
 
 ## Required package contents
 
@@ -11,7 +14,7 @@ An `.ipalensplugin` file is a ZIP archive whose root should contain:
 
 The catalog entry and `Plugin.json` must also provide a concise `description`. This is the short summary shown below the plugin on the storefront homepage; it is not a replacement for `README.md`.
 
-Optional artwork and documentation resources may use the existing allowlisted JSON, plist, Markdown, PNG, and ICNS formats. Scripts, native binaries, symlinks, and other executable resources are rejected.
+Optional artwork and documentation resources may use the existing allowlisted JSON, plist, Markdown, PNG, and ICNS formats. Scripts, symlinks, and undeclared native binaries are rejected. A privileged extension may contain only native files explicitly declared in its signed version 2 manifest.
 
 ## Storefront identity
 
@@ -36,7 +39,9 @@ The scanner reports:
 - recognized system-command references found statically in plugin JSON, plist, and Markdown resources;
 - network access used by IPALens to contact the approved catalog provider for downloads and updates.
 
-These disclosures describe host-controlled behavior, not direct macOS permission grants. A data-only plugin cannot execute a command or access a file by itself.
+For an official privileged extension, the scanner also reports executable code, Keychain, USB-device, Apple Account, Xcode-installation, and fixed-command capabilities. Every executable component declares an ID, role, normalized package path, SHA-256, supported architectures, minimum macOS version, and complete allowlist of fixed system commands. IPALens verifies these declarations during storefront inspection, installation, and every launch.
+
+These disclosures describe host-controlled behavior, not direct macOS permission grants. A data-only plugin cannot execute a command or access a file by itself. A privileged extension runs only after a user starts its specific workflow and only through IPALens’s verified component service.
 
 ## Packaging rules
 
@@ -48,3 +53,9 @@ These disclosures describe host-controlled behavior, not direct macOS permission
 - Match the manifest ID, version, publisher, and host API to the signed catalog entry.
 
 IPALens scans every package before installation and installs it atomically. An invalid update never replaces the working version.
+
+## Privileged extension manifest
+
+Privileged extensions use `schemaVersion: 2`, `hostAPIVersion: 2`, `kind: "privilegedExtension"`, omit `platform`, and declare at least one `components` entry. Component resources must live below `Components/` or `Tools/`, fit the package size limits, match their lowercase SHA-256, and support only `arm64` and/or `x86_64` as declared.
+
+Privileged extension publishing is reserved to the IPALens project. The catalog artifact signature, immutable URL, catalog envelope, component hashes, and official public key form one verification chain. A README is still required, and it must explain setup, requested capabilities, destructive or external effects, account handling, limitations, and removal behavior in plain language.

@@ -319,39 +319,7 @@ private struct OverviewDetail: View {
 private struct SigningDetail: View {
     @ObservedObject var model: WorkspaceModel
     var body: some View {
-        if let signing = model.selectedSigning {
-            Form {
-                Section("Code signature") {
-                    LabeledContent("Status", value: signing.status.rawValue.capitalized)
-                    LabeledContent("Identifier", value: signing.identifier ?? "Unknown")
-                    LabeledContent("Team ID", value: signing.teamIdentifier ?? "Unknown")
-                    if let detail = signing.detail { Text(detail).foregroundStyle(.secondary) }
-                }
-                if let profile = signing.provisioning {
-                    Section("Provisioning profile") {
-                        LabeledContent("Name", value: profile.name ?? "Unknown")
-                        LabeledContent("Distribution", value: profile.distributionKind)
-                        LabeledContent("Expires", value: profile.expirationDate?.formatted() ?? "Unknown")
-                        LabeledContent("Devices", value: String(profile.provisionedDeviceCount))
-                    }
-                }
-                Section("Certificates") {
-                    ForEach(signing.certificates) { certificate in
-                        VStack(alignment: .leading) {
-                            Text(certificate.subject)
-                            Text(certificate.sha256).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                        }
-                    }
-                }
-            }
-            .formStyle(.grouped)
-        } else {
-            EmptyStateView(
-                title: "No Signing Information",
-                symbol: "signature",
-                description: "IPALens could not read a code signature for the selected app bundle."
-            )
-        }
+        SigningExtensionView(model: model.signingExtension)
     }
 }
 

@@ -49,6 +49,7 @@ extension UTType {
 
 @MainActor
 final class WorkspaceModel: ObservableObject {
+    let signingExtension = SigningExtensionModel()
     @Published var sourceURL: URL?
     @Published var snapshot: PackageSnapshot?
     @Published var selectedSection: SidebarSection = .files
@@ -240,6 +241,7 @@ final class WorkspaceModel: ObservableObject {
         hasSecurityScope = url.startAccessingSecurityScopedResource()
         securityScopedURL = hasSecurityScope ? url : nil
         snapshot = nil
+        signingExtension.configure(snapshot: nil, sourceURL: nil)
         entriesByPath = [:]
         treeRoots = []
         expandedDirectoryPaths = []
@@ -286,6 +288,7 @@ final class WorkspaceModel: ObservableObject {
                     Dictionary(uniqueKeysWithValues: inspected.entries.map { ($0.path, $0) })
                 }.value
                 selectedBundlePath = inspected.appBundles.first?.bundlePath
+                signingExtension.configure(snapshot: inspected, sourceURL: url)
                 isLoading = false
                 progress = .init(phase: .complete, completed: 1, total: 1, message: "Inspection complete")
             } catch is CancellationError {
@@ -314,6 +317,7 @@ final class WorkspaceModel: ObservableObject {
         previewTask?.cancel()
         searchTask?.cancel()
         pluginInstallTask?.cancel()
+        signingExtension.close()
         if let sourceURL {
             let inspectionEngine = engine
             Task { await inspectionEngine.forget(url: sourceURL) }

@@ -6,6 +6,10 @@ public enum PluginCapability: String, Codable, CaseIterable, Sendable, Hashable 
     case zipArchive
     case diskImage
     case installerPackage
+    case iOSPersonalTeamSigning
+    case usbDeviceManagement
+    case xcodeManagement
+    case appleDeveloperAccount
 
     public var displayName: String {
         switch self {
@@ -13,7 +17,49 @@ public enum PluginCapability: String, Codable, CaseIterable, Sendable, Hashable 
         case .zipArchive: "ZIP archives"
         case .diskImage: "Disk images"
         case .installerPackage: "Installer packages"
+        case .iOSPersonalTeamSigning: "Personal Team signing"
+        case .usbDeviceManagement: "USB device management"
+        case .xcodeManagement: "Xcode management"
+        case .appleDeveloperAccount: "Apple Developer account"
         }
+    }
+}
+
+public enum PluginKind: String, Codable, Sendable, Hashable {
+    case platformDefinition
+    case privilegedExtension
+}
+
+public enum PluginComponentRole: String, Codable, Sendable, Hashable {
+    case signingService
+    case xcodeInstallerTool
+}
+
+public struct PluginComponentV1: Codable, Sendable, Hashable, Identifiable {
+    public let id: String
+    public let role: PluginComponentRole
+    public let relativePath: String
+    public let sha256: String
+    public let architectures: [String]
+    public let minimumMacOS: String
+    public let allowedCommands: [String]
+
+    public init(
+        id: String,
+        role: PluginComponentRole,
+        relativePath: String,
+        sha256: String,
+        architectures: [String],
+        minimumMacOS: String,
+        allowedCommands: [String]
+    ) {
+        self.id = id
+        self.role = role
+        self.relativePath = relativePath
+        self.sha256 = sha256
+        self.architectures = architectures
+        self.minimumMacOS = minimumMacOS
+        self.allowedCommands = allowedCommands
     }
 }
 
@@ -117,7 +163,12 @@ public struct PluginManifestV1: Codable, Sendable, Hashable, Identifiable {
     public let description: String
     public let hostAPIVersion: Int
     public let capabilities: [PluginCapability]
-    public let platform: PlatformDefinitionV1
+    public let kind: PluginKind?
+    public let platform: PlatformDefinitionV1?
+    public let components: [PluginComponentV1]?
+
+    public var resolvedKind: PluginKind { kind ?? .platformDefinition }
+    public var resolvedComponents: [PluginComponentV1] { components ?? [] }
 
     public init(
         schemaVersion: Int = 1,
@@ -128,7 +179,9 @@ public struct PluginManifestV1: Codable, Sendable, Hashable, Identifiable {
         description: String,
         hostAPIVersion: Int = 1,
         capabilities: [PluginCapability],
-        platform: PlatformDefinitionV1
+        kind: PluginKind = .platformDefinition,
+        platform: PlatformDefinitionV1? = nil,
+        components: [PluginComponentV1] = []
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -138,7 +191,9 @@ public struct PluginManifestV1: Codable, Sendable, Hashable, Identifiable {
         self.description = description
         self.hostAPIVersion = hostAPIVersion
         self.capabilities = capabilities
+        self.kind = kind
         self.platform = platform
+        self.components = components
     }
 }
 
@@ -257,6 +312,11 @@ public enum PluginPermissionKind: String, Codable, CaseIterable, Sendable, Hasha
     case installerPackages
     case providerNetwork
     case systemCommand
+    case executableCode
+    case keychain
+    case usbDevices
+    case appleDeveloperAccount
+    case xcodeInstallation
 
     public var symbolName: String {
         switch self {
@@ -267,6 +327,11 @@ public enum PluginPermissionKind: String, Codable, CaseIterable, Sendable, Hasha
         case .installerPackages: "shippingbox.fill"
         case .providerNetwork: "network"
         case .systemCommand: "terminal.fill"
+        case .executableCode: "cpu.fill"
+        case .keychain: "key.fill"
+        case .usbDevices: "cable.connector"
+        case .appleDeveloperAccount: "person.crop.circle.badge.checkmark"
+        case .xcodeInstallation: "hammer.fill"
         }
     }
 }
@@ -339,6 +404,8 @@ public enum PluginError: LocalizedError, Sendable {
     case pluginNotFound
     case pluginInUse
     case downloadFailed(String)
+    case executablePluginRequiresOfficialSource
+    case componentVerificationFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -355,6 +422,8 @@ public enum PluginError: LocalizedError, Sendable {
         case .pluginNotFound: "The requested plugin is not available."
         case .pluginInUse: "Close packages using this plugin before removing it."
         case .downloadFailed(let detail): "The plugin download failed: \(detail)"
+        case .executablePluginRequiresOfficialSource: "Executable extensions can only be installed from the verified IPALens official catalog."
+        case .componentVerificationFailed(let path): "The executable plugin component failed verification: \(path)"
         }
     }
 }

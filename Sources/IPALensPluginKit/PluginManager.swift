@@ -3,8 +3,9 @@ import Foundation
 import ZIPFoundation
 
 public actor PluginManager {
-    public static let hostAPIVersion = 1
+    public static let hostAPIVersion = 2
     public static let macOSPluginID = "com.eripum9.ipalens.platform.macos"
+    public static let signingPluginID = "com.eripum9.ipalens.extension.signing"
     public static let officialCatalogURL = URL(
         string: "https://raw.githubusercontent.com/eripum9/IPALens-Plugins/main/catalog-v1.json"
     )!
@@ -16,13 +17,14 @@ public actor PluginManager {
     private static let maximumCatalogBytes = 1 * 1_024 * 1_024
     private static let maximumPluginBytes = 50 * 1_024 * 1_024
     private static let maximumPluginResourceBytes = 10 * 1_024 * 1_024
+    private static let maximumExecutableComponentBytes = 40 * 1_024 * 1_024
     private static let maximumManifestBytes = 1 * 1_024 * 1_024
     private static let maximumPluginEntries = 1_000
 
     private let storageRoot: URL
     private let sourcesFile: URL
     private let session: URLSession
-    private var inUsePluginIDs: Set<String> = []
+    private var inUsePluginCounts: [String: Int] = [:]
 
     public init(storageRoot: URL? = nil, session: URLSession? = nil) {
         let root = storageRoot ?? FileManager.default.urls(
@@ -108,7 +110,7 @@ public actor PluginManager {
         }
         let payload = try Self.verifyEnvelope(envelope, publicKey: source.publicKey)
         for entry in payload.plugins {
-            guard entry.hostAPIVersion == Self.hostAPIVersion else {
+            guard Self.supportsHostAPI(entry.hostAPIVersion) else {
                 throw PluginError.incompatibleHostAPI(entry.hostAPIVersion)
             }
             try Self.validateRemoteURL(entry.artifactURL)
@@ -168,7 +170,7 @@ public actor PluginManager {
         from source: PluginSource,
         progress: (@Sendable (Double) -> Void)?
     ) async throws -> PluginInstallation {
-        guard entry.hostAPIVersion == Self.hostAPIVersion else {
+        guard Self.supportsHostAPI(entry.hostAPIVersion) else {
             throw PluginError.incompatibleHostAPI(entry.hostAPIVersion)
         }
         let package = try await download(
@@ -198,7 +200,11 @@ public actor PluginManager {
             throw PluginError.hashMismatch
         }
         try Self.verify(signature: entry.signature, data: package, publicKey: source.publicKey)
-        return try Self.inspectPackageData(package, expected: entry)
+        return try Self.inspectPackageData(
+            package,
+            expected: entry,
+            allowExecutableComponents: source.trust == .official
+        )
     }
 
     public func packageDetails(for installation: PluginInstallation) throws -> PluginPackageDetails {
@@ -245,14 +251,25 @@ public actor PluginManager {
     }
 
     public func removePlugin(id: String) throws {
-        guard !inUsePluginIDs.contains(id) else { throw PluginError.pluginInUse }
+        guard inUsePluginCounts[id, default: 0] == 0 else { throw PluginError.pluginInUse }
         let target = storageRoot.appendingPathComponent(Self.safeComponent(id), isDirectory: true)
         guard FileManager.default.fileExists(atPath: target.path) else { throw PluginError.pluginNotFound }
         try FileManager.default.removeItem(at: target)
     }
 
-    public func beginUsing(pluginID: String) { inUsePluginIDs.insert(pluginID) }
-    public func endUsing(pluginID: String) { inUsePluginIDs.remove(pluginID) }
+    public func beginUsing(pluginID: String) {
+        inUsePluginCounts[pluginID, default: 0] += 1
+    }
+
+    public func endUsing(pluginID: String) {
+        guard let count = inUsePluginCounts[pluginID] else { return }
+        if count <= 1 { inUsePluginCounts.removeValue(forKey: pluginID) }
+        else { inUsePluginCounts[pluginID] = count - 1 }
+    }
+
+    public func pluginsInUse() -> Set<String> {
+        Set(inUsePluginCounts.compactMap { $0.value > 0 ? $0.key : nil })
+    }
 
     public static func verifyEnvelope(
         _ envelope: PluginCatalogEnvelopeV1,
@@ -287,6 +304,16 @@ public actor PluginManager {
         expected: PluginCatalogEntry?
     ) throws -> PluginInstallation {
         guard data.count <= Self.maximumPluginBytes else { throw PluginError.pluginTooLarge }
+        let allowsExecutableComponents = trust == .official
+        let inspected = try Self.inspectPackageData(
+            data,
+            expected: expected,
+            allowExecutableComponents: allowsExecutableComponents
+        )
+        let manifest = inspected.manifest
+        if manifest.resolvedKind == .privilegedExtension, !allowsExecutableComponents {
+            throw PluginError.executablePluginRequiresOfficialSource
+        }
         let fileManager = FileManager.default
         let stagingRoot = fileManager.temporaryDirectory
             .appendingPathComponent("IPALens-Plugin-\(UUID().uuidString)", isDirectory: true)
@@ -320,11 +347,16 @@ public actor PluginManager {
                 throw PluginError.invalidPackage("Symbolic links are not permitted.")
             }
             if entry.type == .file {
-                try Self.validateAllowedFile(normalized)
-                let perFileLimit = normalized == "Plugin.json"
-                    ? Self.maximumManifestBytes
-                    : Self.maximumPluginResourceBytes
-                guard entry.uncompressedSize <= UInt32(perFileLimit) else {
+                try Self.validateAllowedFile(
+                    normalized,
+                    manifest: manifest,
+                    allowExecutableComponents: allowsExecutableComponents
+                )
+                let perFileLimit = Self.maximumBytes(
+                    for: normalized,
+                    manifest: manifest
+                )
+                guard entry.uncompressedSize <= UInt64(perFileLimit) else {
                     throw PluginError.invalidPackage("A plugin resource exceeds its size limit: \(normalized)")
                 }
             }
@@ -340,16 +372,11 @@ public actor PluginManager {
             }
         }
 
-        let manifestURL = extractedURL.appendingPathComponent("Plugin.json")
-        let manifest = try Self.decodeManifest(Data(contentsOf: manifestURL))
-        if let expected {
-            guard manifest.id == expected.id,
-                  manifest.version == expected.version,
-                  manifest.publisher == expected.publisher,
-                  manifest.hostAPIVersion == expected.hostAPIVersion else {
-                throw PluginError.invalidPackage("The manifest does not match its catalog entry.")
-            }
-        }
+        try Self.verifyInstalledComponents(
+            manifest: manifest,
+            extractedRoot: extractedURL,
+            allowExecutableComponents: allowsExecutableComponents
+        )
 
         try fileManager.createDirectory(at: storageRoot, withIntermediateDirectories: true)
         let pluginRoot = storageRoot.appendingPathComponent(Self.safeComponent(manifest.id), isDirectory: true)
@@ -393,7 +420,8 @@ public actor PluginManager {
 
     private static func inspectPackageData(
         _ data: Data,
-        expected: PluginCatalogEntry?
+        expected: PluginCatalogEntry?,
+        allowExecutableComponents: Bool
     ) throws -> PluginPackageDetails {
         guard data.count <= maximumPluginBytes else { throw PluginError.pluginTooLarge }
         let archive: Archive
@@ -408,6 +436,7 @@ public actor PluginManager {
         var normalizedPaths = Set<String>()
         var resourcePaths: [String] = []
         var resources: [String: Data] = [:]
+        var fileEntries: [(path: String, size: UInt64)] = []
         for entry in archive {
             entryCount += 1
             guard entryCount <= maximumPluginEntries else {
@@ -423,14 +452,7 @@ public actor PluginManager {
                 throw PluginError.invalidPackage("Symbolic links are not permitted.")
             }
             guard entry.type == .file else { continue }
-
-            try validateAllowedFile(normalized)
-            let perFileLimit = normalized == "Plugin.json"
-                ? maximumManifestBytes
-                : maximumPluginResourceBytes
-            guard entry.uncompressedSize <= UInt32(perFileLimit) else {
-                throw PluginError.invalidPackage("A plugin resource exceeds its size limit: \(normalized)")
-            }
+            fileEntries.append((normalized, entry.uncompressedSize))
             resourcePaths.append(normalized)
             let fileExtension = (normalized as NSString).pathExtension.lowercased()
             guard ["json", "plist", "md"].contains(fileExtension) else { continue }
@@ -446,6 +468,20 @@ public actor PluginManager {
             throw PluginError.invalidPackage("The package must contain Plugin.json at its root.")
         }
         let manifest = try decodeManifest(manifestData)
+        if manifest.resolvedKind == .privilegedExtension, !allowExecutableComponents {
+            throw PluginError.executablePluginRequiresOfficialSource
+        }
+        for file in fileEntries {
+            try validateAllowedFile(
+                file.path,
+                manifest: manifest,
+                allowExecutableComponents: allowExecutableComponents
+            )
+            let perFileLimit = maximumBytes(for: file.path, manifest: manifest)
+            guard file.size <= UInt64(perFileLimit) else {
+                throw PluginError.invalidPackage("A plugin resource exceeds its size limit: \(file.path)")
+            }
+        }
         if let expected {
             guard manifest.id == expected.id,
                   manifest.version == expected.version,
@@ -503,6 +539,15 @@ public actor PluginManager {
                 evidence: "IPALens host access; the plugin receives no direct filesystem access"
             )
         ]
+        if manifest.resolvedKind == .privilegedExtension {
+            permissions.append(.init(
+                id: "executable-components",
+                kind: .executableCode,
+                title: "Executable Extension Components",
+                explanation: "Runs separately from IPALens after official signature, component hash, architecture, and path verification.",
+                evidence: "Manifest kind: privilegedExtension"
+            ))
+        }
         for capability in manifest.capabilities {
             switch capability {
             case .applicationBundle:
@@ -545,7 +590,62 @@ public actor PluginManager {
                     command: "/usr/sbin/pkgutil",
                     evidence: "Declared installerPackage capability"
                 ))
-            }
+            case .iOSPersonalTeamSigning:
+                permissions.append(.init(
+                    id: "personal-team-signing",
+                    kind: .keychain,
+                    title: "Signing Identities",
+                    explanation: "Uses an Apple Development identity and provisioning profiles managed by Xcode for the selected Personal Team.",
+                    evidence: "Declared capability: iOSPersonalTeamSigning"
+                ))
+                permissions.append(systemCommandPermission(
+                    command: "/usr/bin/codesign",
+                    evidence: "Declared iOSPersonalTeamSigning capability"
+                ))
+            case .usbDeviceManagement:
+                permissions.append(.init(
+                    id: "usb-devices",
+                    kind: .usbDevices,
+                    title: "Connected iPhone and iPad Devices",
+                    explanation: "Lists paired devices and installs only a user-selected, re-signed iOS application.",
+                    evidence: "Declared capability: usbDeviceManagement"
+                ))
+                permissions.append(systemCommandPermission(
+                    command: "/usr/bin/xcrun",
+                    evidence: "Declared usbDeviceManagement capability"
+                ))
+            case .xcodeManagement:
+                permissions.append(.init(
+                    id: "xcode-installation",
+                    kind: .xcodeInstallation,
+                    title: "Xcode Installation",
+                    explanation: "Evaluates this Mac and can download a compatible Xcode from Apple after two separate confirmations.",
+                    evidence: "Declared capability: xcodeManagement"
+                ))
+                permissions.append(systemCommandPermission(
+                    command: "/usr/bin/xcodebuild",
+                    evidence: "Declared xcodeManagement capability"
+                ))
+            case .appleDeveloperAccount:
+                permissions.append(.init(
+                    id: "apple-developer-account",
+                    kind: .appleDeveloperAccount,
+                    title: "Apple Developer Account",
+                    explanation: "Connects to Apple only for Xcode downloads and Personal Team provisioning initiated by the user.",
+                    evidence: "Declared capability: appleDeveloperAccount"
+                ))
+        }
+
+        var componentCommands = Set<String>()
+        for component in manifest.resolvedComponents {
+            componentCommands.formUnion(component.allowedCommands)
+        }
+        for command in componentCommands.sorted() {
+            permissions.append(systemCommandPermission(
+                command: command,
+                evidence: "Allowed command declared by a verified executable component"
+            ))
+        }
         }
 
         var commandIDs = Set(permissions.filter { $0.kind == .systemCommand }.map(\.id))
@@ -567,7 +667,7 @@ public actor PluginManager {
             id: "command-\(safeComponent(command))",
             kind: .systemCommand,
             title: (command as NSString).lastPathComponent,
-            explanation: "This command is host-controlled. Data-only plugins cannot execute commands themselves.",
+            explanation: "Use of this fixed command is disclosed and limited to the verified extension workflow.",
             evidence: "\(evidence) → \(command)"
         )
     }
@@ -585,6 +685,8 @@ public actor PluginManager {
         ("otool", "/usr/bin/otool"),
         ("xcrun", "/usr/bin/xcrun"),
         ("xcodebuild", "/usr/bin/xcodebuild"),
+        ("xcode-select", "/usr/bin/xcode-select"),
+        ("xip", "/usr/bin/xip"),
         ("open", "/usr/bin/open"),
         ("osascript", "/usr/bin/osascript"),
         ("bash", "/bin/bash"),
@@ -689,7 +791,7 @@ public actor PluginManager {
         }
         let allowedRootKeys: Set<String> = [
             "schemaVersion", "id", "name", "version", "publisher", "description",
-            "hostAPIVersion", "capabilities", "platform"
+            "hostAPIVersion", "capabilities", "kind", "platform", "components"
         ]
         let unknownRootKeys = Set(rootObject.keys).subtracting(allowedRootKeys)
         guard unknownRootKeys.isEmpty else {
@@ -697,19 +799,31 @@ public actor PluginManager {
                 "Plugin.json contains unknown fields: \(unknownRootKeys.sorted().joined(separator: ", "))."
             )
         }
-        guard let platformObject = rootObject["platform"] as? [String: Any] else {
-            throw PluginError.invalidPackage("Plugin.json is missing its platform definition.")
-        }
         let allowedPlatformKeys: Set<String> = [
             "platformIdentifier", "displayName", "appBundleSuffix", "infoPlistRelativePath",
             "executableDirectory", "frameworksDirectories", "componentDirectories",
             "componentSuffixes", "minimumSystemVersionKey", "privacyManifestNames"
         ]
-        let unknownPlatformKeys = Set(platformObject.keys).subtracting(allowedPlatformKeys)
-        guard unknownPlatformKeys.isEmpty else {
-            throw PluginError.invalidPackage(
-                "The platform definition contains unknown fields: \(unknownPlatformKeys.sorted().joined(separator: ", "))."
-            )
+        if let platformObject = rootObject["platform"] as? [String: Any] {
+            let unknownPlatformKeys = Set(platformObject.keys).subtracting(allowedPlatformKeys)
+            guard unknownPlatformKeys.isEmpty else {
+                throw PluginError.invalidPackage(
+                    "The platform definition contains unknown fields: \(unknownPlatformKeys.sorted().joined(separator: ", "))."
+                )
+            }
+        }
+        let allowedComponentKeys: Set<String> = [
+            "id", "role", "relativePath", "sha256", "architectures", "minimumMacOS", "allowedCommands"
+        ]
+        if let componentObjects = rootObject["components"] as? [[String: Any]] {
+            for componentObject in componentObjects {
+                let unknownKeys = Set(componentObject.keys).subtracting(allowedComponentKeys)
+                guard unknownKeys.isEmpty else {
+                    throw PluginError.invalidPackage(
+                        "A component contains unknown fields: \(unknownKeys.sorted().joined(separator: ", "))."
+                    )
+                }
+            }
         }
         let decoder = JSONDecoder()
         let manifest: PluginManifestV1
@@ -718,8 +832,8 @@ public actor PluginManager {
         } catch {
             throw PluginError.invalidPackage("Plugin.json could not be decoded.")
         }
-        guard manifest.schemaVersion == 1,
-              manifest.hostAPIVersion == hostAPIVersion,
+        guard (1...2).contains(manifest.schemaVersion),
+              supportsHostAPI(manifest.hostAPIVersion),
               !manifest.id.isEmpty,
               safeComponent(manifest.id) == manifest.id,
               !manifest.name.isEmpty,
@@ -727,6 +841,38 @@ public actor PluginManager {
               safeComponent(manifest.version) == manifest.version,
               !manifest.publisher.isEmpty else {
             throw PluginError.invalidPackage("Plugin.json contains unsupported or missing values.")
+        }
+        switch manifest.resolvedKind {
+        case .platformDefinition:
+            guard manifest.platform != nil, manifest.resolvedComponents.isEmpty else {
+                throw PluginError.invalidPackage("A platform plugin must contain a platform definition and no executable components.")
+            }
+        case .privilegedExtension:
+            guard manifest.schemaVersion == 2,
+                  manifest.platform == nil,
+                  !manifest.resolvedComponents.isEmpty else {
+                throw PluginError.invalidPackage("A privileged extension must declare verified components and no platform definition.")
+            }
+            var componentIDs = Set<String>()
+            var componentPaths = Set<String>()
+            let allowedCommandPaths = Set(recognizedCommands.map(\.path) + [
+                "/usr/bin/ditto", "/usr/bin/xip", "/usr/bin/xcode-select"
+            ])
+            for component in manifest.resolvedComponents {
+                let normalizedPath = try validatePackagePath(component.relativePath)
+                guard normalizedPath == component.relativePath,
+                      normalizedPath.hasPrefix("Components/") || normalizedPath.hasPrefix("Tools/"),
+                      componentIDs.insert(component.id).inserted,
+                      componentPaths.insert(normalizedPath.lowercased()).inserted,
+                      component.sha256.count == 64,
+                      component.sha256.allSatisfy({ $0.isHexDigit }),
+                      !component.architectures.isEmpty,
+                      Set(component.architectures).isSubset(of: ["arm64", "x86_64"]),
+                      !component.minimumMacOS.isEmpty,
+                      Set(component.allowedCommands).isSubset(of: allowedCommandPaths) else {
+                    throw PluginError.invalidPackage("A privileged extension component contains unsupported values.")
+                }
+            }
         }
         return manifest
     }
@@ -750,12 +896,56 @@ public actor PluginManager {
             .precomposedStringWithCanonicalMapping
     }
 
-    private static func validateAllowedFile(_ path: String) throws {
+    private static func validateAllowedFile(
+        _ path: String,
+        manifest: PluginManifestV1,
+        allowExecutableComponents: Bool
+    ) throws {
         let allowedExtensions = ["json", "plist", "md", "png", "icns"]
         let fileExtension = (path as NSString).pathExtension.lowercased()
-        guard allowedExtensions.contains(fileExtension) else {
+        if allowedExtensions.contains(fileExtension) { return }
+        guard allowExecutableComponents,
+              manifest.resolvedKind == .privilegedExtension,
+              manifest.resolvedComponents.contains(where: { $0.relativePath == path }) else {
             throw PluginError.invalidPackage("Unsupported file type: \(path)")
         }
+    }
+
+    private static func maximumBytes(for path: String, manifest: PluginManifestV1) -> Int {
+        if path == "Plugin.json" { return maximumManifestBytes }
+        if manifest.resolvedComponents.contains(where: { $0.relativePath == path }) {
+            return maximumExecutableComponentBytes
+        }
+        return maximumPluginResourceBytes
+    }
+
+    private static func verifyInstalledComponents(
+        manifest: PluginManifestV1,
+        extractedRoot: URL,
+        allowExecutableComponents: Bool
+    ) throws {
+        guard manifest.resolvedKind == .privilegedExtension else { return }
+        guard allowExecutableComponents else { throw PluginError.executablePluginRequiresOfficialSource }
+        let fileManager = FileManager.default
+        for component in manifest.resolvedComponents {
+            let url = extractedRoot.appendingPathComponent(component.relativePath).standardizedFileURL
+            guard url.path.hasPrefix(extractedRoot.standardizedFileURL.path + "/"),
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  sha256(data) == component.sha256.lowercased() else {
+                throw PluginError.componentVerificationFailed(component.relativePath)
+            }
+            try fileManager.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o500))],
+                ofItemAtPath: url.path
+            )
+        }
+    }
+
+    private static func supportsHostAPI(_ version: Int) -> Bool {
+        version > 0 && version <= hostAPIVersion
     }
 
     private static func safeComponent(_ value: String) -> String {
