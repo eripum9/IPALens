@@ -40,6 +40,8 @@ IPALens treats every package and plugin as untrusted input.
 
 iOS App Support is built in and cannot be removed. Official macOS App Support is distributed from the separate [IPALens-Plugins repository](https://github.com/eripum9/IPALens-Plugins) and is verified with an Ed25519 signature plus SHA-256 before atomic installation.
 
+Plugins appear in a dedicated App Store-style window with maker and provider details, a full README, and an IPALens-generated Permissions page. Plugin makers should follow [PLUGIN-AUTHORING.md](PLUGIN-AUTHORING.md), including the root `README.md` requirement. Older or local packages without a README display “No description was provided.”
+
 Third-party catalogs require an HTTPS URL and explicit key-fingerprint approval. Local unsigned plugins require a separate warning and confirmation. Neither is controlled or reviewed by the IPALens project.
 
 ## Requirements

@@ -35,7 +35,14 @@ struct IPALensApplication: App {
         .defaultSize(width: 1_260, height: 780)
         .commands {
             IPALensCommands()
+            PluginStoreCommands()
         }
+
+        Window("Plugins", id: "plugin-store") {
+            PluginStoreView()
+                .frame(minWidth: 900, minHeight: 640)
+        }
+        .defaultSize(width: 1_120, height: 760)
 
         Settings {
             IPALensSettingsView()
@@ -44,30 +51,33 @@ struct IPALensApplication: App {
 }
 
 private struct IPALensSettingsView: View {
-    var body: some View {
-        TabView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("IPALens")
-                    .font(.title2.bold())
-                Text("Native App Package Explorer for macOS")
-                Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Divider()
-                Label("Inspections stay on this Mac", systemImage: "lock")
-                Label("Never modifies source packages", systemImage: "doc.badge.ellipsis")
-                Label("GitHub access is used only for plugin actions", systemImage: "network")
-                Text("IPALens reports observable package evidence and does not make malware or safety claims.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(24)
-            .tabItem { Label("General", systemImage: "gearshape") }
+    @Environment(\.openWindow) private var openWindow
 
-            PluginSettingsView()
-                .tabItem { Label("Plugins", systemImage: "puzzlepiece.extension") }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("IPALens")
+                .font(.title2.bold())
+            Text("Native App Package Explorer for macOS")
+            Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Divider()
+            Label("Inspections stay on this Mac", systemImage: "lock")
+            Label("Never modifies source packages", systemImage: "doc.badge.ellipsis")
+            Label("GitHub access is used only for plugin actions", systemImage: "network")
+            Text("IPALens reports observable package evidence and does not make malware or safety claims.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Divider()
+            Button {
+                openWindow(id: "plugin-store")
+            } label: {
+                Label("Open Plugin Store", systemImage: "puzzlepiece.extension")
+            }
+            .buttonStyle(.borderedProminent)
         }
-        .frame(width: 680, height: 520)
+        .padding(24)
+        .frame(width: 480, height: 340)
     }
 }
 
@@ -136,6 +146,19 @@ struct IPALensCommands: Commands {
             Button("Copy Package Path") { copyPathAction?.perform() }
                 .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(copyPathAction == nil)
+        }
+    }
+}
+
+private struct PluginStoreCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .appSettings) {
+            Button("Plugin Store…") {
+                openWindow(id: "plugin-store")
+            }
+            .keyboardShortcut("p", modifiers: [.command, .shift])
         }
     }
 }

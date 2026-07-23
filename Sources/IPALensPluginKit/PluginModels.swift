@@ -249,6 +249,74 @@ public struct PluginInstallation: Identifiable, Codable, Sendable, Hashable {
     }
 }
 
+public enum PluginPermissionKind: String, Codable, CaseIterable, Sendable, Hashable {
+    case userSelectedFiles
+    case applicationBundles
+    case archives
+    case diskImages
+    case installerPackages
+    case providerNetwork
+    case systemCommand
+
+    public var symbolName: String {
+        switch self {
+        case .userSelectedFiles: "folder.fill"
+        case .applicationBundles: "app.fill"
+        case .archives: "archivebox.fill"
+        case .diskImages: "externaldrive.fill"
+        case .installerPackages: "shippingbox.fill"
+        case .providerNetwork: "network"
+        case .systemCommand: "terminal.fill"
+        }
+    }
+}
+
+public struct PluginPermission: Identifiable, Codable, Sendable, Hashable {
+    public let id: String
+    public let kind: PluginPermissionKind
+    public let title: String
+    public let explanation: String
+    public let evidence: String
+
+    public init(
+        id: String,
+        kind: PluginPermissionKind,
+        title: String,
+        explanation: String,
+        evidence: String
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.explanation = explanation
+        self.evidence = evidence
+    }
+}
+
+public struct PluginPackageDetails: Codable, Sendable, Hashable {
+    public static let missingReadmeText = "No description was provided."
+
+    public let manifest: PluginManifestV1
+    public let readme: String
+    public let hasReadme: Bool
+    public let permissions: [PluginPermission]
+    public let resourcePaths: [String]
+
+    public init(
+        manifest: PluginManifestV1,
+        readme: String,
+        hasReadme: Bool,
+        permissions: [PluginPermission],
+        resourcePaths: [String]
+    ) {
+        self.manifest = manifest
+        self.readme = readme
+        self.hasReadme = hasReadme
+        self.permissions = permissions
+        self.resourcePaths = resourcePaths
+    }
+}
+
 public struct PluginSourceCandidate: Sendable, Hashable {
     public let name: String
     public let catalogURL: URL

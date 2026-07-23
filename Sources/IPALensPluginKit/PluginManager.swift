@@ -160,14 +160,80 @@ public actor PluginManager {
     }
 
     public func install(entry: PluginCatalogEntry, from source: PluginSource) async throws -> PluginInstallation {
+        try await install(entry: entry, from: source, progress: nil)
+    }
+
+    public func install(
+        entry: PluginCatalogEntry,
+        from source: PluginSource,
+        progress: (@Sendable (Double) -> Void)?
+    ) async throws -> PluginInstallation {
         guard entry.hostAPIVersion == Self.hostAPIVersion else {
             throw PluginError.incompatibleHostAPI(entry.hostAPIVersion)
         }
-        let package = try await download(url: entry.artifactURL, maximumBytes: Self.maximumPluginBytes)
+        let package = try await download(
+            url: entry.artifactURL,
+            maximumBytes: Self.maximumPluginBytes,
+            expectedBytes: entry.downloadSize,
+            progress: progress
+        )
         guard Int64(package.count) == entry.downloadSize else { throw PluginError.hashMismatch }
         guard Self.sha256(package) == entry.sha256.lowercased() else { throw PluginError.hashMismatch }
         try Self.verify(signature: entry.signature, data: package, publicKey: source.publicKey)
         return try installPackageData(package, trust: source.trust, sourceName: source.name, expected: entry)
+    }
+
+    public func packageDetails(
+        entry: PluginCatalogEntry,
+        from source: PluginSource
+    ) async throws -> PluginPackageDetails {
+        let package = try await download(
+            url: entry.artifactURL,
+            maximumBytes: Self.maximumPluginBytes,
+            expectedBytes: entry.downloadSize,
+            progress: nil
+        )
+        guard Int64(package.count) == entry.downloadSize,
+              Self.sha256(package) == entry.sha256.lowercased() else {
+            throw PluginError.hashMismatch
+        }
+        try Self.verify(signature: entry.signature, data: package, publicKey: source.publicKey)
+        return try Self.inspectPackageData(package, expected: entry)
+    }
+
+    public func packageDetails(for installation: PluginInstallation) throws -> PluginPackageDetails {
+        let fileManager = FileManager.default
+        let root = installation.installationURL.standardizedFileURL
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw PluginError.invalidPackage("The installed plugin resources could not be read.")
+        }
+        var resources: [String: Data] = [:]
+        var resourcePaths: [String] = []
+        for case let resourceURL as URL in enumerator {
+            let values = try resourceURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard values.isRegularFile == true,
+                  values.fileSize ?? 0 <= Self.maximumPluginResourceBytes else { continue }
+            let standardized = resourceURL.standardizedFileURL
+            guard standardized.path.hasPrefix(root.path + "/") else { continue }
+            let relativePath = String(standardized.path.dropFirst(root.path.count + 1))
+            resourcePaths.append(relativePath)
+            let fileExtension = (relativePath as NSString).pathExtension.lowercased()
+            guard ["json", "plist", "md"].contains(fileExtension) else { continue }
+            resources[relativePath] = try Data(contentsOf: standardized, options: .mappedIfSafe)
+        }
+        return Self.makePackageDetails(
+            manifest: installation.manifest,
+            resources: resources,
+            resourcePaths: resourcePaths
+        )
     }
 
     public func importLocalPackage(url: URL, allowUnsigned: Bool) throws -> PluginInstallation {
@@ -325,12 +391,238 @@ public actor PluginManager {
         )
     }
 
+    private static func inspectPackageData(
+        _ data: Data,
+        expected: PluginCatalogEntry?
+    ) throws -> PluginPackageDetails {
+        guard data.count <= maximumPluginBytes else { throw PluginError.pluginTooLarge }
+        let archive: Archive
+        do {
+            archive = try Archive(data: data, accessMode: .read)
+        } catch {
+            throw PluginError.invalidPackage("The file is not a readable ZIP archive.")
+        }
+
+        var entryCount = 0
+        var uncompressedBytes: Int64 = 0
+        var normalizedPaths = Set<String>()
+        var resourcePaths: [String] = []
+        var resources: [String: Data] = [:]
+        for entry in archive {
+            entryCount += 1
+            guard entryCount <= maximumPluginEntries else {
+                throw PluginError.invalidPackage("The package contains too many files.")
+            }
+            let normalized = try validatePackagePath(entry.path)
+            guard normalizedPaths.insert(normalized.lowercased()).inserted else {
+                throw PluginError.invalidPackage("Duplicate path: \(normalized)")
+            }
+            uncompressedBytes += Int64(entry.uncompressedSize)
+            guard uncompressedBytes <= maximumPluginBytes else { throw PluginError.pluginTooLarge }
+            guard entry.type != .symlink else {
+                throw PluginError.invalidPackage("Symbolic links are not permitted.")
+            }
+            guard entry.type == .file else { continue }
+
+            try validateAllowedFile(normalized)
+            let perFileLimit = normalized == "Plugin.json"
+                ? maximumManifestBytes
+                : maximumPluginResourceBytes
+            guard entry.uncompressedSize <= UInt32(perFileLimit) else {
+                throw PluginError.invalidPackage("A plugin resource exceeds its size limit: \(normalized)")
+            }
+            resourcePaths.append(normalized)
+            let fileExtension = (normalized as NSString).pathExtension.lowercased()
+            guard ["json", "plist", "md"].contains(fileExtension) else { continue }
+            var resourceData = Data()
+            resourceData.reserveCapacity(Int(entry.uncompressedSize))
+            _ = try archive.extract(entry) { chunk in
+                resourceData.append(chunk)
+            }
+            resources[normalized] = resourceData
+        }
+
+        guard let manifestData = resources["Plugin.json"] else {
+            throw PluginError.invalidPackage("The package must contain Plugin.json at its root.")
+        }
+        let manifest = try decodeManifest(manifestData)
+        if let expected {
+            guard manifest.id == expected.id,
+                  manifest.version == expected.version,
+                  manifest.publisher == expected.publisher,
+                  manifest.hostAPIVersion == expected.hostAPIVersion else {
+                throw PluginError.invalidPackage("The manifest does not match its catalog entry.")
+            }
+        }
+        return makePackageDetails(
+            manifest: manifest,
+            resources: resources,
+            resourcePaths: resourcePaths
+        )
+    }
+
+    private static func makePackageDetails(
+        manifest: PluginManifestV1,
+        resources: [String: Data],
+        resourcePaths: [String]? = nil
+    ) -> PluginPackageDetails {
+        let readmeResource = resources.first { $0.key.lowercased() == "readme.md" }
+        let decodedReadme = readmeResource
+            .flatMap { String(data: $0.value, encoding: .utf8) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let hasReadme = decodedReadme?.isEmpty == false
+        let readme = hasReadme ? decodedReadme! : PluginPackageDetails.missingReadmeText
+
+        var searchableResources: [(String, String)] = []
+        for (path, data) in resources {
+            if let text = String(data: data, encoding: .utf8) {
+                searchableResources.append((path, text))
+            } else {
+                searchableResources.append((path, String(decoding: data, as: UTF8.self)))
+            }
+        }
+        return PluginPackageDetails(
+            manifest: manifest,
+            readme: readme,
+            hasReadme: hasReadme,
+            permissions: permissions(for: manifest, resources: searchableResources),
+            resourcePaths: (resourcePaths ?? Array(resources.keys)).sorted()
+        )
+    }
+
+    private static func permissions(
+        for manifest: PluginManifestV1,
+        resources: [(String, String)]
+    ) -> [PluginPermission] {
+        var permissions: [PluginPermission] = [
+            PluginPermission(
+                id: "user-selected-files",
+                kind: .userSelectedFiles,
+                title: "Files and Folders",
+                explanation: "Reads only packages and export locations selected by the user.",
+                evidence: "IPALens host access; the plugin receives no direct filesystem access"
+            )
+        ]
+        for capability in manifest.capabilities {
+            switch capability {
+            case .applicationBundle:
+                permissions.append(.init(
+                    id: "application-bundles",
+                    kind: .applicationBundles,
+                    title: "Application Bundles",
+                    explanation: "Defines how IPALens reads application bundle metadata and contents.",
+                    evidence: "Declared capability: applicationBundle"
+                ))
+            case .zipArchive:
+                permissions.append(.init(
+                    id: "zip-archives",
+                    kind: .archives,
+                    title: "Compressed Archives",
+                    explanation: "Allows IPALens to inspect supported ZIP containers without executing their contents.",
+                    evidence: "Declared capability: zipArchive"
+                ))
+            case .diskImage:
+                permissions.append(.init(
+                    id: "disk-images",
+                    kind: .diskImages,
+                    title: "Disk Images",
+                    explanation: "Allows verified, read-only inspection of disk-image contents.",
+                    evidence: "Declared capability: diskImage"
+                ))
+                permissions.append(systemCommandPermission(
+                    command: "/usr/bin/hdiutil",
+                    evidence: "Declared diskImage capability"
+                ))
+            case .installerPackage:
+                permissions.append(.init(
+                    id: "installer-packages",
+                    kind: .installerPackages,
+                    title: "Installer Packages",
+                    explanation: "Allows package payloads to be expanded for read-only inspection; installer scripts remain inert.",
+                    evidence: "Declared capability: installerPackage"
+                ))
+                permissions.append(systemCommandPermission(
+                    command: "/usr/sbin/pkgutil",
+                    evidence: "Declared installerPackage capability"
+                ))
+            }
+        }
+
+        var commandIDs = Set(permissions.filter { $0.kind == .systemCommand }.map(\.id))
+        for command in recognizedCommands {
+            guard let resource = resources.first(where: { containsCommand(command, in: $0.1) }) else { continue }
+            let permission = systemCommandPermission(
+                command: command.path,
+                evidence: "Static reference found in \(resource.0)"
+            )
+            if commandIDs.insert(permission.id).inserted {
+                permissions.append(permission)
+            }
+        }
+        return permissions
+    }
+
+    private static func systemCommandPermission(command: String, evidence: String) -> PluginPermission {
+        PluginPermission(
+            id: "command-\(safeComponent(command))",
+            kind: .systemCommand,
+            title: (command as NSString).lastPathComponent,
+            explanation: "This command is host-controlled. Data-only plugins cannot execute commands themselves.",
+            evidence: "\(evidence) → \(command)"
+        )
+    }
+
+    private static let recognizedCommands: [(name: String, path: String)] = [
+        ("hdiutil", "/usr/bin/hdiutil"),
+        ("pkgutil", "/usr/sbin/pkgutil"),
+        ("codesign", "/usr/bin/codesign"),
+        ("security", "/usr/bin/security"),
+        ("spctl", "/usr/sbin/spctl"),
+        ("installer", "/usr/sbin/installer"),
+        ("diskutil", "/usr/sbin/diskutil"),
+        ("ditto", "/usr/bin/ditto"),
+        ("plutil", "/usr/bin/plutil"),
+        ("otool", "/usr/bin/otool"),
+        ("xcrun", "/usr/bin/xcrun"),
+        ("xcodebuild", "/usr/bin/xcodebuild"),
+        ("open", "/usr/bin/open"),
+        ("osascript", "/usr/bin/osascript"),
+        ("bash", "/bin/bash"),
+        ("zsh", "/bin/zsh"),
+        ("sh", "/bin/sh"),
+        ("python3", "/usr/bin/python3"),
+        ("node", "/usr/local/bin/node")
+    ]
+
+    private static func containsCommand(_ command: (name: String, path: String), in text: String) -> Bool {
+        if text.range(of: command.path, options: .caseInsensitive) != nil { return true }
+        let lowercased = text.lowercased()
+        let name = command.name.lowercased()
+        if lowercased.contains("`\(name)`") ||
+            lowercased.contains("\"\(name)\"") ||
+            lowercased.contains("'\(name)'") {
+            return true
+        }
+        let escaped = NSRegularExpression.escapedPattern(for: command.name)
+        let pattern = "(?m)^\\s*(?:\\$\\s*)?\(escaped)(?:\\s|$)"
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            return false
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.firstMatch(in: text, range: range) != nil
+    }
+
     private func persistSources(_ sources: [PluginSource]) throws {
         try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
         try JSONEncoder.pretty.encode(sources).write(to: sourcesFile, options: .atomic)
     }
 
-    private func download(url: URL, maximumBytes: Int) async throws -> Data {
+    private func download(
+        url: URL,
+        maximumBytes: Int,
+        expectedBytes: Int64? = nil,
+        progress: (@Sendable (Double) -> Void)? = nil
+    ) async throws -> Data {
         do {
             let (bytes, response) = try await session.bytes(from: url)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -343,11 +635,27 @@ public actor PluginManager {
             }
             var data = Data()
             data.reserveCapacity(min(maximumBytes, max(0, Int(http.expectedContentLength))))
+            let progressTotal: Int64?
+            if let expectedBytes, expectedBytes > 0 {
+                progressTotal = expectedBytes
+            } else if http.expectedContentLength > 0 {
+                progressTotal = http.expectedContentLength
+            } else {
+                progressTotal = nil
+            }
+            progress?(0)
+            var nextProgressUpdate = 16 * 1_024
             for try await byte in bytes {
                 try Task.checkCancellation()
                 guard data.count < maximumBytes else { throw Self.sizeError(for: maximumBytes) }
                 data.append(byte)
+                if data.count >= nextProgressUpdate,
+                   let progressTotal {
+                    progress?(min(1, Double(data.count) / Double(progressTotal)))
+                    nextProgressUpdate = data.count + 16 * 1_024
+                }
             }
+            progress?(1)
             return data
         } catch let error as PluginError {
             throw error

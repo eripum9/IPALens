@@ -169,6 +169,52 @@ struct PluginKitTests {
         #expect(try await manager.installedPlugin(id: installation.id) == nil)
     }
 
+    @Test func readsStorefrontReadmeAndScansPermissionEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IPALens-PluginDetailsTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("Source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        var manifest = validManifestObject()
+        manifest["capabilities"] = ["applicationBundle", "diskImage", "installerPackage"]
+        try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            .write(to: source.appendingPathComponent("Plugin.json"))
+        try Data("# Test Plugin\n\nUses `/usr/bin/codesign` for documented verification.\n".utf8)
+            .write(to: source.appendingPathComponent("README.md"))
+        let package = root.appendingPathComponent("Details.ipalensplugin")
+        try FileManager.default.zipItem(at: source, to: package, shouldKeepParent: false)
+
+        let manager = PluginManager(storageRoot: root.appendingPathComponent("Installed", isDirectory: true))
+        let installation = try await manager.importLocalPackage(url: package, allowUnsigned: true)
+        let details = try await manager.packageDetails(for: installation)
+
+        #expect(details.hasReadme)
+        #expect(details.readme.contains("Test Plugin"))
+        #expect(details.permissions.contains { $0.kind == .diskImages })
+        #expect(details.permissions.contains { $0.evidence.contains("/usr/bin/hdiutil") })
+        #expect(details.permissions.contains { $0.evidence.contains("/usr/sbin/pkgutil") })
+        #expect(details.permissions.contains { $0.evidence.contains("/usr/bin/codesign") })
+    }
+
+    @Test func displaysFallbackWhenReadmeIsMissing() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IPALens-MissingReadmeTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("Source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: validManifestObject(), options: [.sortedKeys])
+            .write(to: source.appendingPathComponent("Plugin.json"))
+        let package = root.appendingPathComponent("MissingReadme.ipalensplugin")
+        try FileManager.default.zipItem(at: source, to: package, shouldKeepParent: false)
+
+        let manager = PluginManager(storageRoot: root.appendingPathComponent("Installed", isDirectory: true))
+        let installation = try await manager.importLocalPackage(url: package, allowUnsigned: true)
+        let details = try await manager.packageDetails(for: installation)
+
+        #expect(!details.hasReadme)
+        #expect(details.readme == PluginPackageDetails.missingReadmeText)
+    }
+
     private func validManifestObject() -> [String: Any] {
         [
             "schemaVersion": 1,
